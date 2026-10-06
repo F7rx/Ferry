@@ -12,7 +12,13 @@
 <p align="center">
   <a href="https://github.com/F7rx/Ferry/actions/workflows/ci.yml"><img src="https://github.com/F7rx/Ferry/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache 2.0"></a>
+  <a href="https://github.com/F7rx/Ferry/releases/latest"><img src="https://img.shields.io/github/v/release/F7rx/Ferry?label=download" alt="Latest release"></a>
 </p>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/home-dark.png">
+  <img src="docs/screenshots/home-light.png" alt="Ferry's home screen: nearby devices arranged around a drop zone, with receiving settings and recent transfers on the side">
+</picture>
 
 Files, folders, text and links go straight from one device to another,
 encrypted end to end. Ferry speaks the LocalSend protocol, so it works with the
@@ -23,6 +29,25 @@ device tiles, an Inbox, and a hardened security model.
 > **Status:** early but working. The desktop app (verified on Windows), the
 > `ferry` CLI and the browser app work end to end on the local network and over
 > WebRTC. Mobile builds are next.
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/incoming.png" alt="An incoming transfer: the sender, the files and their sizes, with Decline, Accept and trust, and Accept"><p align="center"><sub>Accept, decline or pick files before anything arrives</sub></p></td>
+    <td width="50%"><img src="docs/screenshots/transfers.png" alt="Two transfers in progress with speed, time left, and pause and cancel buttons"><p align="center"><sub>Several transfers at once, each resumable</sub></p></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/devices.png" alt="The Devices screen: paired devices, trusted devices and devices nearby"><p align="center"><sub>Paired, trusted and nearby devices</sub></p></td>
+    <td><img src="docs/screenshots/inbox.png" alt="The Inbox in dark mode: received photos, documents and audio in a grid"><p align="center"><sub>Everything you've received, in one place</sub></p></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/screenshots/phone-home.png" width="260" alt="Ferry on a phone: nearby devices in a grid under the drop zone">
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/phone-pair.png" width="260" alt="Pairing on a phone: the same 6-digit code shown on both screens">
+</p>
 
 ## Features
 
@@ -36,9 +61,25 @@ device tiles, an Inbox, and a hardened security model.
 - **Browser links.** Share files with any browser on the same network through a QR code, or let a browser send files to you, protected by a token, an optional PIN and an expiry.
 - **Careful with your files.** Hostile file names and path tricks are rejected, nothing gets overwritten, memory use stays flat, and there is no telemetry.
 
-## Getting started
+## Download
 
-Ferry is built from source for now. You need Rust 1.97 and Node 22 or newer.
+Installers for Windows, macOS and Linux are on the
+[releases page](https://github.com/F7rx/Ferry/releases/latest):
+
+| Platform | File |
+|---|---|
+| Windows 10 and 11 | `Ferry_x.y.z_x64-setup.exe` (or the `.msi`) |
+| macOS | `Ferry_x.y.z_universal.dmg` (Apple silicon and Intel) |
+| Linux | `.AppImage`, `.deb` or `.rpm` |
+
+The installers aren't code-signed yet. On Windows, SmartScreen may show
+"Windows protected your PC": select **More info**, then **Run anyway**. On
+macOS, if it says Apple can't check the app, open **System Settings ›
+Privacy & Security** and select **Open Anyway**.
+
+## Building from source
+
+You need Rust 1.97 and Node 22 or newer.
 On Windows, install the MSVC build tools (WebView2 ships with Windows 11).
 On Linux, install the [Tauri system packages](https://v2.tauri.app/start/prerequisites/).
 
