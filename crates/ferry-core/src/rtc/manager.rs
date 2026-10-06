@@ -190,6 +190,9 @@ pub struct RtcManager {
     me: Weak<RtcManager>,
     state: Mutex<State>,
     running: Mutex<Option<Running>>,
+    /// Serializes start/stop: two overlapping restarts would otherwise each
+    /// replace `running`, leaving one signaling connection orphaned but live.
+    lifecycle: Mutex<()>,
     connect_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     nearby: std::sync::atomic::AtomicBool,
     loopback: std::sync::atomic::AtomicBool,
@@ -204,6 +207,7 @@ impl RtcManager {
             me: me.clone(),
             state: Mutex::new(State::default()),
             running: Mutex::new(None),
+            lifecycle: Mutex::new(()),
             connect_locks: tokio::sync::Mutex::new(HashMap::new()),
             nearby: std::sync::atomic::AtomicBool::new(true),
             loopback: std::sync::atomic::AtomicBool::new(false),
@@ -253,7 +257,8 @@ impl RtcManager {
     /// Connects to `settings.signaling_url` (no-op without one). Restarts a
     /// running connection.
     pub fn start(&self) {
-        self.stop();
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        self.stop_running();
         let Some(this) = self.arc() else { return };
         let settings = self.shared.settings.get();
         let Some(url) = settings.signaling_url.clone().filter(|u| !u.trim().is_empty()) else {
@@ -283,6 +288,11 @@ impl RtcManager {
 
     /// Disconnects from signaling and closes every session.
     pub fn stop(&self) {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        self.stop_running();
+    }
+
+    fn stop_running(&self) {
         let running = self.running.lock().unwrap().take();
         if let Some(r) = running {
             r.stop.cancel();

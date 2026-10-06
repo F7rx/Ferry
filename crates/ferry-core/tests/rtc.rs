@@ -44,9 +44,10 @@ async fn rtc_peer(alias: &str, url: &str, tweak: impl FnOnce(&mut Settings)) -> 
     peer
 }
 
-/// The WebRTC device id of `alias`, once it is online.
+/// The WebRTC device id of `alias`, once it is online. Generous: CI runs these
+/// tests in parallel on two cores, and every peer generates its keys first.
 async fn find(peer: &Peer, alias: &str) -> String {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             if let Some(d) = peer.engine.devices().into_iter().find(|d| d.alias == alias && d.online && d.id.starts_with("rtc:")) {
                 return d.id;
@@ -93,7 +94,22 @@ async fn files_folders_and_text_arrive_intact() {
     write_file(&folder, "2026/one.jpg", &pattern(300_000, 2));
     write_file(&folder, "2026/deep/two.txt", b"two");
     write_file(&folder, "empty.dat", b"");
-    let mut requests = b.engine.subscribe();
+    let mut events = b.engine.subscribe();
+    let requests = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        loop {
+            match events.recv().await {
+                Ok(EngineEvent::IncomingRequest { request }) => {
+                    seen.push(request);
+                    if seen.len() == 2 {
+                        return seen;
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("event stream closed: {e}"),
+            }
+        }
+    });
     let responder = b.auto_respond(Decision::accept_all());
 
     let started = std::time::Instant::now();
@@ -127,15 +143,13 @@ async fn files_folders_and_text_arrive_intact() {
     // The text arrived as a message, the request listed the folder structure.
     let mut saw_text = false;
     let mut saw_files = false;
-    while let Ok(e) = requests.try_recv() {
-        if let EngineEvent::IncomingRequest { request } = e {
-            match &request.text {
-                Some(t) => saw_text |= t == "hello over WebRTC",
-                None => {
-                    saw_files = true;
-                    assert!(request.files.iter().any(|f| f.name == "Album/2026/deep/two.txt"));
-                    assert!(!request.trusted);
-                }
+    for request in tokio::time::timeout(LONG, requests).await.expect("both requests arrive").unwrap() {
+        match &request.text {
+            Some(t) => saw_text |= t == "hello over WebRTC",
+            None => {
+                saw_files = true;
+                assert!(request.files.iter().any(|f| f.name == "Album/2026/deep/two.txt"));
+                assert!(!request.trusted);
             }
         }
     }
@@ -400,7 +414,10 @@ async fn interrupted_transfers_resume_where_they_stopped() {
     let big = write_file(src.path(), "resume.bin", &pattern(40 * 1024 * 1024, 8));
     let responder = b.auto_respond(Decision::accept_all());
     let id = send(&a, &bob, vec![SendItem::Path { path: big.clone() }]).await.remove(0);
-    let incoming = b.wait_transfer(LONG, |t| t.direction == Direction::Receive && t.bytes_done > 6 * 1024 * 1024).await;
+    let incoming = tokio::select! {
+        t = b.wait_transfer(LONG, |t| t.direction == Direction::Receive && t.bytes_done > 6 * 1024 * 1024) => t,
+        t = a.wait_transfer(LONG, |t| t.id == id && t.state.is_final()) => panic!("the send ended before reaching Bob: {t:?}"),
+    };
     // The receiver's connection drops (signaling and sessions restart).
     b.engine.set_webrtc_loopback(true);
     let reconnecting = a.wait_transfer(LONG, |t| t.id == id && t.state == TransferState::Reconnecting).await;

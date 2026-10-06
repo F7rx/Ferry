@@ -755,7 +755,17 @@ impl Inner {
         if self.closed.is_cancelled() {
             return Err(RtcError::new("closed", "data channel is not open"));
         }
-        self.transport.send(Frame::Text(text)).await.map_err(|e| RtcError::new("closed", format!("data channel is not open: {e}")))
+        self.write(Frame::Text(text)).await
+    }
+
+    /// A write that gives up once the session closes: a write to a data channel
+    /// that died underneath it can otherwise wait forever. Never abandoned while
+    /// the session is open, since a half-written message breaks the channel.
+    async fn write(&self, frame: Frame) -> Result<(), RtcError> {
+        tokio::select! {
+            r = self.transport.send(frame) => r.map_err(|e| RtcError::new("closed", format!("data channel is not open: {e}"))),
+            _ = self.closed.cancelled() => Err(RtcError::new("closed", "data channel is not open")),
+        }
     }
 
     async fn send_control(&self, msg: &Control) -> Result<(), RtcError> {
@@ -1277,7 +1287,12 @@ async fn timer(inner: Arc<Inner>) {
     loop {
         tokio::select! {
             _ = inner.closed.cancelled() => return,
-            _ = ping.tick() => { let _ = inner.send_control(&Control::Ping).await; }
+            _ = ping.tick() => {
+                // Off this loop: a ping stuck on a dead channel must not hold up
+                // the timeout check below, which is what closes that channel.
+                let inner = inner.clone();
+                tokio::spawn(async move { let _ = inner.send_control(&Control::Ping).await; });
+            }
             _ = check.tick() => {
                 if inner.last_inbound.lock().unwrap().elapsed() > opts.timeout {
                     inner.shutdown(CloseReason::Timeout, Some("no frames from the peer".into()));
@@ -1842,10 +1857,9 @@ impl Inner {
                     }
                 }
                 pos += chunk.len() as u64;
-                self.transport
-                    .send(Frame::Binary(chunk))
-                    .await
-                    .map_err(|e| RtcError::new("closed", format!("data channel is not open: {e}")))?;
+                if let Err(e) = self.write(Frame::Binary(chunk)).await {
+                    return Err(if self.closed.is_cancelled() { self.outgoing_error(token) } else { e });
+                }
                 let mut st = self.st.lock().unwrap();
                 self.progress(&mut st, Direction::Send, &transfer_id, id, pos, size);
             }

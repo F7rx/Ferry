@@ -94,7 +94,17 @@ impl Peer {
             }
         })
         .await
-        .expect("timed out waiting for transfer state")
+        .unwrap_or_else(|_| {
+            let seen: Vec<String> = self
+                .engine
+                .transfers()
+                .iter()
+                .map(|t| {
+                    format!("{:?} {:?} {}/{} {:?}", t.direction, t.state, t.bytes_done, t.total_bytes, t.error.as_ref().map(|e| &e.code))
+                })
+                .collect();
+            panic!("timed out waiting for transfer state; transfers now: {seen:?}")
+        })
     }
 
     pub async fn wait_event(&mut self, timeout: Duration, pred: impl Fn(&EngineEvent) -> bool) -> EngineEvent {
