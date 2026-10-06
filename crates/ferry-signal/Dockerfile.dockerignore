@@ -1,0 +1,11 @@
+# Used by BuildKit for `docker build -f crates/ferry-signal/Dockerfile .`
+# (paths are relative to the build context, the repository root).
+.git
+.upstream
+.ferry-dev
+target
+**/target
+node_modules
+**/node_modules
+apps/app/dist
+bench/out

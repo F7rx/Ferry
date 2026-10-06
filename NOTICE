@@ -1,0 +1,28 @@
+Ferry
+Copyright 2026 the Ferry authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+-------------------------------------------------------------------------------
+This product includes software derived from LocalSend
+(https://github.com/localsend/localsend), licensed under the Apache License,
+Version 2.0. Copyright 2022-2026 Tien Do Nam and the LocalSend contributors.
+
+  - crates/localsend/  is a vendored copy of LocalSend's `packages/core` crate
+    (commit 2ef4dc6af1b81b3bee69db9b54299e39e6f368d1). Files changed by the
+    Ferry authors carry a "Modified by the Ferry authors" notice; the full list
+    is in crates/localsend/UPSTREAM.md.
+  - Ferry implements the LocalSend v2 wire protocol for interoperability with
+    LocalSend devices. "LocalSend" is used here only to describe that
+    compatibility; Ferry is not affiliated with or endorsed by the LocalSend
+    project, and uses none of its names, logos or visual identity.
+
+-------------------------------------------------------------------------------
+Third-party components keep their own licenses (see Cargo.lock and
+package-lock.json for the full dependency list). Notable ones:
+
+  - Geist and Geist Mono typefaces: SIL Open Font License 1.1, © Vercel
+  - Lucide icons: ISC License, © Lucide Contributors
+  - rustls, tokio, hyper, reqwest, webrtc-rs: Apache-2.0 / MIT
+  - Vue, Vite: MIT
+  - Tauri: Apache-2.0 / MIT

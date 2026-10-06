@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex">
+<title>Ferry</title>
+<style>
+:root {
+  /* Monochrome: white surfaces with black accents (dark: black with white). */
+  --bg: #f3f3f3; --glass: rgba(255,255,255,.78); --solid: #fff; --fill: rgba(0,0,0,.045); --fill2: rgba(0,0,0,.08);
+  --rim: rgba(0,0,0,.08); --edge: rgba(255,255,255,.9); --t1: #0a0a0a; --t2: #3d3d3d; --t3: #666;
+  --accent: #3366ff; --accent-text: #2350e6; --on-accent: #fff; --grad: linear-gradient(180deg,#3366ff 0%,#2350e6 100%); --mark: #0a0a0a; --mark-ink: #fff;
+  --soft: rgba(51,102,255,.1); --ok: #0e8546; --okbg: rgba(14,133,70,.1); --warn: #a35f00; --warnbg: rgba(196,122,0,.12); --bad: #c8102e;
+  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 18px 44px -18px rgba(0,0,0,.18); --glow: rgba(255,255,255,.6); --btn-glow: rgba(51,102,255,.35);
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #000; --glass: rgba(22,22,22,.82); --solid: #121212; --fill: rgba(255,255,255,.04); --fill2: rgba(255,255,255,.08);
+    --rim: rgba(255,255,255,.1); --edge: rgba(255,255,255,.06); --t1: #f5f5f5; --t2: #b8b8b8; --t3: #8f8f8f;
+    --accent: #3366ff; --accent-text: #8fb0ff; --on-accent: #fff; --grad: linear-gradient(180deg,#3d6eff 0%,#2a5af0 100%); --mark: #fff; --mark-ink: #0a0a0a;
+    --soft: rgba(91,140,255,.16); --ok: #3ccf82; --okbg: rgba(60,207,130,.13); --warn: #f0b04a; --warnbg: rgba(240,176,74,.13); --bad: #ff5c6a;
+    --shadow: 0 2px 6px rgba(0,0,0,.5), 0 24px 56px -16px rgba(0,0,0,.8); --glow: rgba(255,255,255,.06); --btn-glow: rgba(51,102,255,.35); }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body {
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--t1); letter-spacing: -.005em;
+  background: var(--bg) radial-gradient(900px 600px at 10% -10%, var(--glow), transparent 60%) fixed;
+  display: grid; place-items: start center; padding: max(24px, env(safe-area-inset-top)) 16px 32px;
+  -webkit-font-smoothing: antialiased;
+}
+main { width: 100%; max-width: 560px; }
+.card { background: var(--glass); -webkit-backdrop-filter: blur(24px) saturate(160%); backdrop-filter: blur(24px) saturate(160%);
+  border: 1px solid var(--rim); box-shadow: inset 0 1px 0 var(--edge), var(--shadow); border-radius: 28px; padding: 24px; }
+header { display: flex; align-items: center; gap: 10px; margin: 4px 4px 18px; font-weight: 680; letter-spacing: -.02em; }
+header svg { width: 28px; height: 28px; }
+h1 { font-size: 1.6rem; line-height: 1.15; letter-spacing: -.025em; margin: 0 0 6px; }
+p { margin: 0; }
+.sub { color: var(--t2); }
+.muted { color: var(--t3); font-size: .85rem; }
+button, .btn { font: inherit; font-weight: 600; border: 1px solid var(--rim); background: var(--fill); color: var(--t1); height: 44px; padding: 0 18px;
+  border-radius: 999px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 8px; text-decoration: none; transition: background .15s, transform .1s; }
+button:hover, .btn:hover { background: var(--fill2); }
+button:active, .btn:active { transform: scale(.97); }
+button:disabled { opacity: .45; cursor: default; }
+.primary { color: var(--on-accent); background: var(--grad); border-color: transparent; box-shadow: 0 8px 20px -8px var(--btn-glow); }
+.primary:hover { background: var(--grad); filter: brightness(1.05); }
+:focus-visible { outline: 3px solid var(--soft); outline-offset: 2px; }
+ul { list-style: none; margin: 18px 0 0; padding: 4px; border-radius: 18px; background: var(--fill); }
+li { display: flex; align-items: center; gap: 12px; min-height: 56px; padding: 6px 8px; border-radius: 12px; }
+li + li { border-top: 1px solid var(--rim); border-radius: 0; }
+.ico { flex: none; width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; background: var(--soft); color: var(--accent-text); }
+.ico svg { width: 18px; height: 18px; }
+.name { flex: 1; min-width: 0; }
+.name b { display: block; font-weight: 600; font-size: .93rem; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.name span { color: var(--t3); font-size: .8rem; font-variant-numeric: tabular-nums; }
+li .btn { height: 36px; padding: 0 14px; font-size: .85rem; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+.actions .primary { flex: 1; }
+.drop { display: block; margin-top: 18px; border: 1.5px dashed color-mix(in srgb, var(--accent) 40%, transparent); border-radius: 22px; padding: 30px 16px; text-align: center;
+  background: var(--fill); transition: background .15s, border-color .15s, transform .25s; cursor: pointer; }
+.drop.hot { background: var(--soft); border-color: var(--accent); transform: scale(1.01); }
+.drop b { display: block; margin-top: 8px; font-size: 1rem; }
+.drop svg { display: block; margin: 0 auto; width: 30px; height: 30px; color: var(--accent-text); }
+textarea, input[type=text], input[type=password] { width: 100%; font: inherit; color: var(--t1); background: var(--solid); border: 1px solid var(--rim); border-radius: 14px; padding: 12px 14px; }
+textarea { min-height: 84px; resize: vertical; margin-top: 14px; }
+input:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--soft); }
+.bar { height: 4px; border-radius: 4px; background: var(--fill2); margin-top: 6px; overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 4px; transition: width .25s linear; }
+.state { margin-top: 16px; padding: 12px 14px; border-radius: 14px; background: var(--fill); font-weight: 560; }
+.state.ok { background: var(--okbg); color: var(--ok); }
+.state.bad { background: rgba(208,48,58,.1); color: var(--bad); }
+.note { display: flex; gap: 8px; align-items: flex-start; margin-top: 18px; padding: 10px 12px; border-radius: 14px; background: var(--warnbg); color: var(--warn); font-size: .82rem; }
+.note svg { flex: none; width: 16px; height: 16px; margin-top: 2px; }
+.row { display: flex; gap: 10px; margin-top: 14px; }
+.row input { flex: 1; }
+.hidden { display: none !important; }
+footer { margin: 16px 4px 0; text-align: center; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <svg viewBox="0 0 512 512" aria-hidden="true"><rect x="24" y="24" width="464" height="464" rx="118" fill="var(--mark)"/><circle cx="154" cy="346" r="30" fill="none" stroke="var(--mark-ink)" stroke-width="22" stroke-opacity=".82"/><path d="M182 312 C 214 214, 292 166, 338 196" fill="none" stroke="var(--mark-ink)" stroke-width="30" stroke-linecap="round"/><circle cx="366" cy="222" r="36" fill="var(--mark-ink)"/></svg>
+    <span>Ferry</span>
+  </header>
+
+  <section class="card" id="loading" aria-busy="true"><p class="sub">Connecting…</p></section>
+
+  <section class="card hidden" id="pin">
+    <h1>Enter the PIN</h1>
+    <p class="sub">It's shown on the device that shared this link.</p>
+    <form class="row" id="pin-form"><input id="pin-input" type="password" inputmode="numeric" autocomplete="one-time-code" aria-label="PIN" required><button class="primary" type="submit">Continue</button></form>
+    <p class="muted" id="pin-error" role="alert"></p>
+  </section>
+
+  <section class="card hidden" id="download">
+    <h1 id="dl-title"></h1>
+    <p class="sub" id="dl-sub"></p>
+    <ul id="dl-list" aria-label="Files"></ul>
+    <div class="actions"><button class="primary" id="dl-all" type="button">Download all</button></div>
+  </section>
+
+  <section class="card hidden" id="upload">
+    <h1 id="ul-title"></h1>
+    <p class="sub">Choose files or type a message. They'll ask before anything is saved.</p>
+    <label class="drop" id="drop" tabindex="0">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/></svg>
+      <b>Choose files</b><span class="muted">or drop them here</span>
+      <input id="files" type="file" multiple class="hidden">
+    </label>
+    <div class="actions"><button type="button" id="pick-folder">Choose a folder</button><input id="folder" type="file" webkitdirectory class="hidden"></div>
+    <textarea id="message" placeholder="Or type a message or link" aria-label="Message"></textarea>
+    <input id="sender" type="text" placeholder="Your name (optional)" aria-label="Your name" style="margin-top:10px" maxlength="40">
+    <ul id="ul-list" class="hidden" aria-label="Sending"></ul>
+    <div class="actions"><button class="primary" id="send" type="button" disabled>Send</button></div>
+    <p class="state hidden" id="ul-state" role="status" aria-live="polite"></p>
+  </section>
+
+  <section class="card hidden" id="error"><h1>Something went wrong</h1><p class="sub" id="error-text"></p></section>
+
+  <p class="note" id="insecure"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>
+    <span>Browser links aren't encrypted on this network. Use them on networks you trust, or install Ferry for encrypted transfers.</span></p>
+  <footer class="muted" id="expiry"></footer>
+</main>
+<script>
+"use strict";
+(function () {
+  const base = location.pathname.replace(/\/$/, "");
+  const $ = (id) => document.getElementById(id);
+  let pin = sessionStorage.getItem("ferry-pin:" + base) || "";
+  let info = null;
+
+  const fmt = (n) => { if (n < 1000) return n + " B"; const u = ["KB","MB","GB","TB"]; let v = n, i = -1; while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; } return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + " " + u[i]; };
+  const show = (id) => { for (const s of ["loading","pin","download","upload","error"]) $(s).classList.toggle("hidden", s !== id); $("loading").setAttribute("aria-busy", String(id === "loading")); };
+  const icon = (name) => { const ext = (name.split(".").pop() || "").toLowerCase();
+    const img = ["jpg","jpeg","png","gif","webp","heic","heif","avif"].includes(ext), vid = ["mp4","mov","mkv","webm"].includes(ext);
+    const p = img ? '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/>'
+      : vid ? '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m10 9 5 3-5 3z"/>'
+      : '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>';
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' + p + "</svg>"; };
+  const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
+  const txt = (s) => document.createTextNode(s);
+  const headers = () => (pin ? { "x-ferry-pin": pin } : {});
+
+  async function load() {
+    let res;
+    try { res = await fetch(base + "/api/info", { headers: headers() }); } catch { return fail("Can't reach the sharing device. Is it still on this network?"); }
+    if (res.status === 401) { const b = await res.json().catch(() => ({})); $("pin-error").textContent = b.error || ""; show("pin"); $("pin-input").focus(); return; }
+    if (!res.ok) return fail(res.status === 404 ? "This link has expired. Ask for a new one." : "The sharing device refused the request.");
+    info = await res.json();
+    $("expiry").textContent = "Link expires " + new Date(info.expiresAtMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    if (info.kind === "download") renderDownload(); else renderUpload();
+  }
+  function fail(msg) { $("error-text").textContent = msg; show("error"); }
+
+  $("pin-form").addEventListener("submit", (e) => { e.preventDefault(); pin = $("pin-input").value.trim(); sessionStorage.setItem("ferry-pin:" + base, pin); load(); });
+
+  function fileUrl(id) { return base + "/api/files/" + encodeURIComponent(id) + (pin ? "?pin=" + encodeURIComponent(pin) : ""); }
+  function renderDownload() {
+    const files = info.files, total = files.reduce((n, f) => n + f.size, 0);
+    $("dl-title").textContent = info.device.alias + (files.length === 1 ? " is sharing a file" : " is sharing " + files.length + " files");
+    $("dl-sub").textContent = fmt(total) + " · tap a file to download it";
+    const list = $("dl-list"); list.textContent = "";
+    for (const f of files) {
+      const li = el("li"); li.appendChild(el("span", "ico", icon(f.name)));
+      const n = el("span", "name"); const b = el("b"); b.appendChild(txt(f.name)); const s = el("span"); s.appendChild(txt(fmt(f.size))); n.append(b, s); li.appendChild(n);
+      const a = el("a", "btn"); a.href = fileUrl(f.id); a.setAttribute("download", f.name.split("/").pop()); a.appendChild(txt("Download")); a.setAttribute("aria-label", "Download " + f.name); li.appendChild(a);
+      list.appendChild(li);
+    }
+    $("dl-all").classList.toggle("hidden", files.length < 2);
+    $("dl-all").onclick = async () => { for (const a of list.querySelectorAll("a")) { a.click(); await new Promise((r) => setTimeout(r, 700)); } };
+    show("download");
+  }
+
+  let chosen = [];
+  function renderUpload() {
+    $("ul-title").textContent = "Send to " + info.device.alias;
+    $("sender").value = localStorage.getItem("ferry-sender") || "";
+    show("upload");
+  }
+  function choose(list) { chosen = Array.from(list || []); refresh(); }
+  function refresh() {
+    const ul = $("ul-list"); ul.textContent = ""; ul.classList.toggle("hidden", chosen.length === 0);
+    chosen.forEach((f, i) => {
+      const li = el("li"); li.appendChild(el("span", "ico", icon(f.name)));
+      const n = el("span", "name"); const b = el("b"); b.appendChild(txt(f.webkitRelativePath || f.name)); const s = el("span"); s.appendChild(txt(fmt(f.size))); s.id = "st" + i;
+      const bar = el("div", "bar", "<i id=\"bar" + i + "\"></i>"); n.append(b, s, bar); li.appendChild(n); ul.appendChild(li);
+    });
+    $("send").disabled = chosen.length === 0 && !$("message").value.trim();
+  }
+  const drop = $("drop");
+  drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("files").click(); } });
+  $("files").addEventListener("change", (e) => choose(e.target.files));
+  $("pick-folder").onclick = () => $("folder").click();
+  $("folder").addEventListener("change", (e) => choose(e.target.files));
+  $("message").addEventListener("input", refresh);
+  ["dragenter","dragover"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("hot"); }));
+  ["dragleave","drop"].forEach((t) => drop.addEventListener(t, () => drop.classList.remove("hot")));
+  drop.addEventListener("drop", (e) => { e.preventDefault(); choose(e.dataTransfer.files); });
+
+  function state(text, kind) { const s = $("ul-state"); s.textContent = text; s.className = "state" + (kind ? " " + kind : ""); }
+  async function prepare(files) {
+    const sender = $("sender").value.trim(); localStorage.setItem("ferry-sender", sender);
+    for (;;) {
+      const res = await fetch(base + "/api/prepare", { method: "POST", headers: Object.assign({ "content-type": "application/json" }, headers()), body: JSON.stringify({ files, sender }) });
+      if (res.status === 401) { const p = prompt(info.device.alias + " needs a PIN"); if (!p) throw new Error("A PIN is needed to send."); pin = p.trim(); continue; }
+      return res;
+    }
+  }
+  $("send").onclick = async () => {
+    $("send").disabled = true;
+    try {
+      const text = $("message").value.trim();
+      if (text) {
+        const bytes = new TextEncoder().encode(text).length;
+        state("Sending your message…");
+        const res = await prepare([{ id: "m", fileName: "message.txt", size: bytes, fileType: "text/plain", preview: text }]);
+        if (res.status !== 204 && !res.ok) throw new Error("The message wasn't accepted.");
+        $("message").value = "";
+        if (!chosen.length) { state("Message delivered ✓", "ok"); return; }
+      }
+      if (!chosen.length) return;
+      const files = chosen.map((f, i) => ({ id: "f" + i, fileName: f.webkitRelativePath || f.name, size: f.size, fileType: f.type || "application/octet-stream" }));
+      state("Waiting for " + info.device.alias + " to accept…");
+      const res = await prepare(files);
+      if (res.status === 403) { state(info.device.alias + " declined.", "bad"); return; }
+      if (res.status === 204) { state("Nothing was accepted.", "bad"); return; }
+      if (!res.ok) { const b = await res.json().catch(() => ({})); throw new Error(b.message || "The transfer wasn't accepted (" + res.status + ")."); }
+      const plan = await res.json();
+      let sent = 0;
+      const total = chosen.reduce((n, f, i) => n + (plan.files["f" + i] ? f.size : 0), 0);
+      for (let i = 0; i < chosen.length; i++) {
+        const token = plan.files["f" + i];
+        if (!token) { $("st" + i).textContent = "Skipped"; continue; }
+        state("Sending… " + fmt(sent) + " of " + fmt(total));
+        await upload(chosen[i], i, plan.sessionId, token, (n) => state("Sending… " + fmt(sent + n) + " of " + fmt(total)));
+        sent += chosen[i].size;
+        $("st" + i).textContent = fmt(chosen[i].size) + " · sent";
+      }
+      state("Sent to " + info.device.alias + " ✓", "ok");
+      chosen = [];
+    } catch (err) {
+      state(err.message || String(err), "bad");
+    } finally {
+      $("send").disabled = false;
+    }
+  };
+  function upload(file, i, sessionId, token, progress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const q = "sessionId=" + encodeURIComponent(sessionId) + "&fileId=f" + i + "&token=" + encodeURIComponent(token);
+      xhr.open("POST", base + "/api/upload?" + q);
+      if (pin) xhr.setRequestHeader("x-ferry-pin", pin);
+      xhr.setRequestHeader("content-type", "application/octet-stream");
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) { $("bar" + i).style.width = (100 * e.loaded / e.total).toFixed(1) + "%"; progress(e.loaded); } };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) { $("bar" + i).style.width = "100%"; resolve(); }
+        else reject(new Error(file.name + " failed (" + xhr.status + ")"));
+      };
+      xhr.onerror = () => reject(new Error("Lost the connection while sending " + file.name + "."));
+      xhr.send(file);
+    });
+  }
+  load();
+})();
+</script>
+</body>
+</html>

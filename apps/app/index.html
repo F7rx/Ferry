@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f3f3f3" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#000000" />
+    <meta name="description" content="Fast, private device-to-device sharing. Files move directly between your devices." />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <title>Ferry</title>
+    <script>
+      // Resolve appearance before first paint so there is no theme flash.
+      // Mirrors src/lib/appearance.ts; keep the storage key in sync.
+      (function () {
+        var root = document.documentElement;
+        var prefs = {};
+        try {
+          prefs = JSON.parse(localStorage.getItem("ferry.appearance") || "{}") || {};
+        } catch (e) {}
+        var mq = function (q) {
+          return window.matchMedia && window.matchMedia(q).matches;
+        };
+        var theme = prefs.theme || "system";
+        if (theme === "system") theme = mq("(prefers-color-scheme: dark)") ? "dark" : "light";
+        root.setAttribute("data-theme", theme);
+        var motion = prefs.motion || "system";
+        root.setAttribute(
+          "data-motion",
+          motion === "reduced" || (motion === "system" && mq("(prefers-reduced-motion: reduce)")) ? "reduced" : "full",
+        );
+        var transparency = prefs.transparency || "system";
+        root.setAttribute(
+          "data-transparency",
+          transparency === "reduced" || (transparency === "system" && mq("(prefers-reduced-transparency: reduce)"))
+            ? "reduced"
+            : "full",
+        );
+        if (mq("(prefers-contrast: more)")) root.setAttribute("data-contrast", "more");
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

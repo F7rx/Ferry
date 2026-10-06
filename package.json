@@ -1,0 +1,13 @@
+{
+  "name": "ferry-monorepo",
+  "private": true,
+  "workspaces": [
+    "apps/app"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w apps/app",
+    "build:web": "npm run build -w apps/app",
+    "test:web": "npm run test -w apps/app",
+    "tauri": "npm run tauri -w apps/app"
+  }
+}

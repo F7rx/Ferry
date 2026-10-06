@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Ferry">
+  <rect x="24" y="24" width="464" height="464" rx="118" fill="#0a0a0a"/>
+  <!-- origin: an open ring; destination: a solid point; the arc is the hop between them -->
+  <circle cx="154" cy="346" r="30" fill="none" stroke="#ffffff" stroke-width="22" stroke-opacity="0.82"/>
+  <path d="M182 312 C 214 214, 292 166, 338 196" fill="none" stroke="#ffffff" stroke-width="30" stroke-linecap="round"/>
+  <circle cx="366" cy="222" r="36" fill="#ffffff"/>
+</svg>

@@ -1,0 +1,31 @@
+# Upstream reference clones (audit only; not part of the product)
+/.upstream/
+
+# Rust
+/target/
+**/target/
+
+# Node
+node_modules/
+dist/
+dev-dist/
+.vite/
+*.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+
+# Tauri
+apps/app/src-tauri/gen/schemas/
+
+# Local runtime data / benchmarks
+/.ferry-dev/
+/bench/out/
+*.log
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

@@ -1,0 +1,51 @@
+name: Bug report
+description: Something doesn't work the way it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Ferry on both devices
+        2. Drop a 2 GB file on the other device
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: app
+    attributes:
+      label: Which Ferry
+      options:
+        - Desktop app
+        - Browser app
+        - ferry CLI
+        - Signaling server
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and version
+      placeholder: Windows 11 24H2, Ferry 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: other
+    attributes:
+      label: Other device
+      description: The device on the other end, and whether it runs Ferry or LocalSend.
+      placeholder: Pixel 9 with LocalSend 1.17
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: For network problems, open Settings › Diagnostics, select "Run network test" and paste the results.
+      render: text

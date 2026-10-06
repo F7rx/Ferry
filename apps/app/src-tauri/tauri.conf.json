@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Ferry",
+  "version": "0.1.0",
+  "identifier": "app.ferry.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build:desktop",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Ferry",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 380,
+        "minHeight": 560,
+        "center": true,
+        "dragDropEnabled": true,
+        "backgroundColor": "#ebeff6"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob:; media-src 'self' asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost",
+      "assetProtocol": {
+        "enable": true,
+        "scope": { "allow": [], "deny": [] }
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi", "app", "dmg", "appimage", "deb", "rpm"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "category": "Utility",
+    "shortDescription": "Fast, private device-to-device sharing",
+    "longDescription": "Ferry sends files, folders, text and links directly between your devices, on your local network or remotely, without accounts or cloud storage. Compatible with LocalSend.",
+    "copyright": "Copyright 2026 the Ferry authors. Includes software from LocalSend (Apache-2.0).",
+    "license": "Apache-2.0",
+    "licenseFile": "../../../LICENSE",
+    "windows": {
+      "nsis": { "installMode": "currentUser", "installerHooks": "./windows/installer-hooks.nsh" }
+    },
+    "linux": {
+      "deb": { "depends": [] }
+    }
+  }
+}

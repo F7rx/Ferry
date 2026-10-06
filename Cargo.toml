@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/localsend",
+    "crates/ferry-core",
+    "crates/ferry-cli",
+    "crates/ferry-signal",
+    "apps/app/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/F7rx/Ferry"
+rust-version = "1.97"
+
+# Profiles are only honored in the workspace root manifest.
+[profile.dev]
+debug = "line-tables-only"
+
+# RSA key generation is bignum-heavy and ~10x slower unoptimized; keep the
+# crypto and hashing crates optimized in dev so tests and debug builds stay fast.
+[profile.dev.package.rsa]
+opt-level = 2
+[profile.dev.package.num-bigint-dig]
+opt-level = 2
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.ring]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "debuginfo"

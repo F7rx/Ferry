@@ -1,0 +1,30 @@
+# Interoperability tests against *unmodified* upstream LocalSend, pinned to the
+# audited commit. A separate workspace so the upstream crate (fetched from
+# GitHub) never mixes with our vendored copy.
+[package]
+name = "ferry-interop"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ferry-core = { path = "../../crates/ferry-core" }
+upstream = { package = "localsend", path = "../../.upstream/localsend/packages/core", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = "0.7"
+tempfile = "3"
+sha2 = "0.11"
+hex = "0.4"
+bytes = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.dev.package.rsa]
+opt-level = 2
+[profile.dev.package.num-bigint-dig]
+opt-level = 2
+[profile.dev.package.ring]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
