@@ -45,7 +45,7 @@ directories = "6"
 base64 = "0.23"
 # WebRTC (ferry-dc/1). All of these are already in the tree through the
 # vendored `localsend` crate, so they add no new compilation.
-webrtc = "0.14"
+webrtc = "0.21"
 ed25519-dalek = { version = "3.0.0", features = ["pem", "rand_core"] }
 ring = "0.17"
 flate2 = "1.1"
