@@ -27,7 +27,7 @@ describing the change. Summary:
 | `src/multicast/mod.rs` | `MulticastDevice::extra` is announced; `MulticastHandle::reply` sends the spec's UDP `announce:false` fallback. |
 | `src/http/client/{mod,scoped_host,server_cert_verifier}.rs` | Made the pinned verifier, scoped-host helpers and resolver public. |
 | `src/http/server/{common/client_cert_verifier,peer_ip}.rs` | Made the client-certificate verifier and `PeerIp::from_remote_addr` public. |
-| `tests/{discovery,event_backpressure,multicast}.rs` | Adapted to `MulticastDevice::extra`. |
+| `tests/{discovery,event_backpressure,multicast}.rs` | Adapted to `MulticastDevice::extra`; the loopback subnet scan test is skipped on macOS, which only routes 127.0.0.1. |
 | `src/crypto/token.rs` | Fixed remote-triggerable panic on tokens with < 5 segments and the unchecked `now - salt` underflow. |
 | `src/model/transfer.rs` | Test `formats_nanosecond_timestamp` made resolution-aware (Windows `SystemTime` has 100 ns ticks). |
 

@@ -106,6 +106,8 @@ async fn register_keeps_answering_when_events_are_not_consumed() {
 /// A scan that confirms more devices than the event channel holds must still
 /// finish and return them, even though the application reads no event.
 #[tokio::test(flavor = "multi_thread")]
+// Modified by the Ferry authors: macOS only routes 127.0.0.1 on loopback.
+#[cfg_attr(target_os = "macos", ignore = "needs every 127.0.0.x address on loopback")]
 async fn subnet_scan_finishes_when_events_are_not_consumed() {
     // Every 127.0.0.x address reaches this server, so the scan confirms the
     // whole subnet at once.
