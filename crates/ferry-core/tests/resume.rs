@@ -123,6 +123,9 @@ async fn pause_and_resume_by_user() {
     tx.wait_transfer(T, |t| t.id == ids[0] && t.bytes_done > 4 * MIB).await;
     assert!(tx.engine.pause(&ids[0]));
     tx.wait_transfer(T, |t| t.id == ids[0] && t.state == TransferState::Paused).await;
+    // Bytes already in socket buffers still drain after the pause (several MB
+    // with Linux autotuning); measure once they have.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     let at_pause = proxy.upstream_bytes();
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(proxy.upstream_bytes() - at_pause < MIB, "paused transfer kept sending");
