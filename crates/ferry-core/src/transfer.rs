@@ -235,6 +235,7 @@ impl TransferEntry {
         let done = files.iter().filter(|f| f.file.state == FileState::Done).count();
         let failed = files.iter().filter(|f| f.file.state == FileState::Failed).count();
         let cancelled = files.iter().filter(|f| f.file.state == FileState::Cancelled).count();
+        let first_error = files.iter().find(|f| f.file.state == FileState::Failed).and_then(|f| f.file.error.clone());
         drop(files);
         let state = if failed == 0 && cancelled == 0 {
             TransferState::Completed
@@ -245,6 +246,13 @@ impl TransferEntry {
         } else {
             TransferState::Failed
         };
+        if state == TransferState::Failed {
+            // Never a bare "Failed": say why, from the file that failed.
+            let mut meta = self.meta.lock().unwrap();
+            if meta.error.is_none() {
+                meta.error = first_error;
+            }
+        }
         self.set_state(state);
         state
     }
@@ -543,5 +551,26 @@ mod tests {
         entry.set_file_state("f1", FileState::Failed, None);
         entry.set_file_state("f2", FileState::Done, None);
         assert_eq!(entry.conclude(), TransferState::CompletedWithErrors);
+    }
+
+    #[test]
+    fn failed_transfer_reports_why() {
+        let registry = TransferRegistry::new(EventBus::new());
+        let entry = registry.create(NewTransfer {
+            id: "t".into(),
+            direction: Direction::Send,
+            drop_id: None,
+            peer: peer(),
+            files: (0..2).map(file).collect(),
+            state: TransferState::Transferring,
+            resumable: true,
+            text: None,
+            save_dir: None,
+            connection: None,
+        });
+        entry.set_file_state("f0", FileState::Failed, Some(ErrorInfo::new("disk", "Disk full")));
+        entry.set_file_state("f1", FileState::Failed, None);
+        assert_eq!(entry.conclude(), TransferState::Failed);
+        assert_eq!(entry.summary().error.map(|e| e.code), Some("disk".to_string()));
     }
 }

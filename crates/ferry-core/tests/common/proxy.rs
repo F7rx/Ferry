@@ -11,6 +11,23 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::AbortHandle;
 
+pub const MIB: u64 = 1024 * 1024;
+
+/// Sends through `proxy` to the engine it fronts, pinned to `fingerprint`.
+pub fn via(proxy: &Proxy, fingerprint: String) -> ferry_core::Target {
+    ferry_core::Target::Address {
+        host: "127.0.0.1".into(),
+        port: proxy.port,
+        protocol: ferry_core::model::Protocol::Https,
+        fingerprint: Some(fingerprint),
+    }
+}
+
+/// The engine's own listening address, for a proxy to forward to.
+pub fn backend(engine: &ferry_core::Engine) -> SocketAddr {
+    format!("127.0.0.1:{}", engine.port()).parse().unwrap()
+}
+
 pub struct Proxy {
     pub port: u16,
     state: Arc<State>,

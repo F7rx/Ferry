@@ -4,23 +4,12 @@
 
 mod common;
 
-use common::proxy::Proxy;
+use common::proxy::{MIB, Proxy, backend, via};
 use common::*;
 use ferry_core::events::EngineEvent;
 use ferry_core::model::*;
-use ferry_core::{Engine, EngineConfig, SendItem, Settings, Target};
-use std::net::SocketAddr;
+use ferry_core::{Engine, EngineConfig, SendItem, Settings};
 use std::time::Duration;
-
-const MIB: u64 = 1024 * 1024;
-
-fn via(proxy: &Proxy, fingerprint: String) -> Target {
-    Target::Address { host: "127.0.0.1".into(), port: proxy.port, protocol: Protocol::Https, fingerprint: Some(fingerprint) }
-}
-
-fn backend(engine: &Engine) -> SocketAddr {
-    format!("127.0.0.1:{}", engine.port()).parse().unwrap()
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn network_drop_continues_from_the_last_byte() {

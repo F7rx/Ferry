@@ -307,7 +307,11 @@ impl SendManager {
                 SendError::Client(e) => describe_status(e, &alias),
                 SendError::User(info) => info.clone(),
             };
-            let state = if info.code == "declined" { TransferState::Declined } else { TransferState::Failed };
+            let state = match info.code.as_str() {
+                "declined" => TransferState::Declined,
+                "cancelled_by_peer" => TransferState::Cancelled,
+                _ => TransferState::Failed,
+            };
             out.entry.fail(state, Some(info));
         }
     }
@@ -742,6 +746,11 @@ impl SendManager {
                     if is_ferry {
                         return FileOutcome::Interrupted;
                     }
+                    return FileOutcome::Fatal(SendError::User(ErrorInfo::cancelled_by_peer()));
+                }
+                Err(ClientError::Status { status: 409, message, .. }) if message == "Cancelled" => {
+                    // The receiver cancelled mid-upload; its /cancel notice may still be on the way.
+                    entry.set_file_state(&file.id, FileState::Pending, None);
                     return FileOutcome::Fatal(SendError::User(ErrorInfo::cancelled_by_peer()));
                 }
                 Err(err) if err.is_connectivity() => {

@@ -2,6 +2,7 @@
 
 mod common;
 
+use common::proxy::{MIB, Proxy, backend, via};
 use common::*;
 use ferry_core::SendItem;
 use ferry_core::events::EngineEvent;
@@ -188,7 +189,9 @@ async fn sender_cancel_cleans_up_receiver() {
     rx.auto_respond(Decision::accept_all());
     let src = tempfile::tempdir().unwrap();
     let path = write_file(src.path(), "huge.bin", &pattern(96 * 1024 * 1024, 5));
-    let ids = tx.engine.send(vec![rx.target()], vec![SendItem::Path { path }]).await.unwrap();
+    let proxy = Proxy::start(backend(&rx.engine)).await;
+    proxy.set_rate(32 * MIB);
+    let ids = tx.engine.send(vec![via(&proxy, rx.engine.fingerprint())], vec![SendItem::Path { path }]).await.unwrap();
     tx.wait_transfer(T, |t| t.id == ids[0] && t.bytes_done > 1_000_000).await;
     assert!(tx.engine.cancel(&ids[0]));
     assert_eq!(tx.wait_final(&ids[0], T).await.state, TransferState::Cancelled);
@@ -206,7 +209,9 @@ async fn receiver_cancel_stops_sender() {
     rx.auto_respond(Decision::accept_all());
     let src = tempfile::tempdir().unwrap();
     let path = write_file(src.path(), "huge.bin", &pattern(96 * 1024 * 1024, 6));
-    let ids = tx.engine.send(vec![rx.target()], vec![SendItem::Path { path }]).await.unwrap();
+    let proxy = Proxy::start(backend(&rx.engine)).await;
+    proxy.set_rate(32 * MIB);
+    let ids = tx.engine.send(vec![via(&proxy, rx.engine.fingerprint())], vec![SendItem::Path { path }]).await.unwrap();
     let incoming = rx.wait_transfer(T, |t| t.direction == Direction::Receive && t.bytes_done > 1_000_000).await;
     assert!(rx.engine.cancel(&incoming.id));
     let sent = tx.wait_final(&ids[0], T).await;
