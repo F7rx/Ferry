@@ -1,7 +1,7 @@
 // Pairing "my devices": show a QR code / link, use one from another device,
 // or compare a 6-digit code with a nearby device.
 import { platform, type DeviceSummary, type PairingRequest } from "../platform";
-import { attempt, displayName, store, toast } from "./engine";
+import { attempt, displayName, markAnswered, store, toast } from "./engine";
 
 export async function showPairingCode() {
   const offer = await attempt(() => platform.createPairingOffer());
@@ -37,6 +37,7 @@ export async function cancelCompare() {
 }
 
 export async function answerPairing(request: PairingRequest, match: boolean) {
+  markAnswered(request.id);
   store.pairing.requests = store.pairing.requests.filter((r) => r.id !== request.id);
   await attempt(() => platform.respondPairing(request.id, match));
 }

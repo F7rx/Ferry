@@ -8,7 +8,7 @@
 // Early exits return the HTTP response itself; it is built once, rarely.
 #![allow(clippy::result_large_err)]
 
-use crate::db::{InboundFileRecord, InboundRecord, NewHistoryEntry};
+use crate::db::{InboundFileRecord, InboundOfferedFile, InboundRecord, NewHistoryEntry};
 use crate::error::ErrorInfo;
 use crate::events::{EngineEvent, NoticeLevel};
 use crate::fsutil::part::{self, DEFAULT_CHECKPOINT_BYTES, OpenError, PartSpec, PartWriter};
@@ -21,15 +21,16 @@ use crate::server::{self, PeerContext, Resp, Routes, empty, error, json};
 use crate::settings::AutoAccept;
 use crate::shared::Shared;
 use crate::transfer::{NewTransfer, TransferEntry};
-use crate::util::{now_ms, random_token, secret_eq};
+use crate::util::{message_history, now_ms, random_token, secret_eq};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::StatusCode;
 use hyper::body::Incoming;
 use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,8 +45,8 @@ const MAX_FILE_SIZE: u64 = 1 << 50;
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PENDING_PER_PEER: usize = 3;
 const MAX_PENDING: usize = 16;
-const MAX_SESSIONS_PER_PEER: usize = 8;
-const MAX_SESSIONS: usize = 32;
+pub(crate) const MAX_SESSIONS_PER_PEER: usize = 8;
+pub(crate) const MAX_SESSIONS: usize = 32;
 const MAX_ATTEMPTS: u32 = 3;
 /// Files at least this big are fsync'd before being renamed into place.
 const SYNC_THRESHOLD: u64 = 8 * 1024 * 1024;
@@ -102,6 +103,13 @@ struct Session {
     released: tokio::sync::Notify,
     /// Folders already created and checked to be inside the save folder.
     checked_dirs: Mutex<HashSet<PathBuf>>,
+    /// Offered files the user did not accept (part of the approved offer).
+    declined: Vec<InboundOfferedFile>,
+    /// False for a transfer restored from a record that predates stored
+    /// checksums and declined files: those are unknown.
+    manifest_known: bool,
+    /// Held while the session is live; see [`SessionSlot`].
+    slot: Mutex<Option<SessionSlot>>,
 }
 
 impl Session {
@@ -136,8 +144,83 @@ pub struct ReceiveManager {
     shared: Arc<Shared>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     pending: Mutex<HashMap<String, Pending>>,
+    slots: Arc<Mutex<SlotTable>>,
+    /// Serializes restoring persisted transfers, so two reconnects racing
+    /// can't both rebuild a session for the same transfer.
+    restore_lock: Mutex<()>,
     pin_failures: FailureTracker,
     prepare_rate: RateLimiter,
+}
+
+/// Session slots in use, per peer (here an IP group; a WebRTC receive keys
+/// them by identity key) and in total.
+pub(crate) struct SlotTable<K = IpAddr> {
+    total: usize,
+    per_peer: HashMap<K, usize>,
+}
+
+impl<K> Default for SlotTable<K> {
+    fn default() -> Self {
+        SlotTable { total: 0, per_peer: HashMap::new() }
+    }
+}
+
+/// One session slot. A request takes it when admitted, holds it while its
+/// user decides, and hands it to the session it creates, which keeps it until
+/// it finishes or goes away; dropping it frees the slot. Pending decisions,
+/// live sessions and restored transfers thus all count against the same caps,
+/// checked and taken under one lock.
+pub(crate) struct SessionSlot<K: Eq + Hash + Clone = IpAddr> {
+    table: Arc<Mutex<SlotTable<K>>>,
+    key: K,
+}
+
+impl<K: Eq + Hash + Clone> SessionSlot<K> {
+    pub(crate) fn reserve(table: &Arc<Mutex<SlotTable<K>>>, key: K, max_total: usize, max_per_peer: usize) -> Option<SessionSlot<K>> {
+        let mut t = table.lock().unwrap();
+        let mine = t.per_peer.get(&key).copied().unwrap_or(0);
+        if t.total >= max_total || mine >= max_per_peer {
+            return None;
+        }
+        t.total += 1;
+        t.per_peer.insert(key.clone(), mine + 1);
+        Some(SessionSlot { table: table.clone(), key })
+    }
+}
+
+impl<K: Eq + Hash + Clone> Drop for SessionSlot<K> {
+    fn drop(&mut self) {
+        let mut t = self.table.lock().unwrap();
+        t.total -= 1;
+        if let Some(n) = t.per_peer.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                t.per_peer.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// What a session is created from.
+struct NewSession {
+    files: IndexMap<String, InFile>,
+    /// The approved save folder: every file of the session stays inside it.
+    save_dir: PathBuf,
+    /// The folder shown for the transfer.
+    save_root: Option<PathBuf>,
+    ferry_transfer_id: Option<String>,
+    created_ms: Option<u64>,
+    declined: Vec<InboundOfferedFile>,
+    manifest_known: bool,
+    slot: SessionSlot,
+}
+
+/// A file as the user approved it (accepted or declined).
+struct ApprovedFile {
+    name: String,
+    size: u64,
+    mime: String,
+    sha256: Option<String>,
 }
 
 /// Removes a pending request when the handler ends: answered, timed out, or
@@ -172,6 +255,8 @@ impl ReceiveManager {
             shared,
             sessions: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            slots: Arc::new(Mutex::new(SlotTable::default())),
+            restore_lock: Mutex::new(()),
             pin_failures: FailureTracker::new(5, 50, Duration::from_secs(5 * 60)),
             prepare_rate: RateLimiter::new(2.0, 10.0),
         })
@@ -255,14 +340,16 @@ impl ReceiveManager {
         // Resumption of a known transfer from the same verified device.
         if let (Some(fp), Some(ext)) = (peer.identity.fingerprint(), request.ferry.as_ref())
             && ext.transfer_id.len() <= 64
-            && let Some(resp) = self.try_resume(peer, fp, &ext.transfer_id, &request, &peer_ref).await
+            && let Some(resp) = self.try_resume(peer, fp, &ext.transfer_id, &request, &specs, &peer_ref).await
         {
             return resp;
         }
 
-        if let Err(resp) = self.check_capacity(peer) {
-            return resp;
-        }
+        // Held until the session exists (or the request ends some other way).
+        let slot = match self.reserve_slot(peer) {
+            Ok(slot) => slot,
+            Err(resp) => return resp,
+        };
 
         let save_dir = settings.save_dir();
         let total: u64 = specs.iter().map(|s| s.size).sum();
@@ -282,15 +369,15 @@ impl ReceiveManager {
         } else {
             let id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = oneshot::channel();
-            self.pending.lock().unwrap().insert(
-                id.clone(),
-                Pending {
-                    decision: Some(tx),
-                    key: peer_key(peer.ip.ip),
-                    ip: peer.ip.ip,
-                    fingerprint: peer.identity.fingerprint().map(str::to_string),
-                },
-            );
+            let pending = Pending {
+                decision: Some(tx),
+                key: peer_key(peer.ip.ip),
+                ip: peer.ip.ip,
+                fingerprint: peer.identity.fingerprint().map(str::to_string),
+            };
+            if !self.add_pending(&id, pending) {
+                return error(StatusCode::CONFLICT, "Blocked by another session");
+            }
             let mut guard = PendingGuard { manager: self, id: id.clone(), reason: "cancelled" };
             let timeout = Duration::from_secs(settings.decision_timeout_secs.clamp(10, 3600));
             self.shared.events.emit(EngineEvent::IncomingRequest {
@@ -345,7 +432,7 @@ impl ReceiveManager {
             (Some(_), Some(ext)) if ext.transfer_id.len() <= 64 => Some(ext.transfer_id.clone()),
             _ => None,
         };
-        match self.create_session(peer, &request.info, peer_ref, &specs, &accepted, save_dir, resumable_id) {
+        match self.create_session(peer, &request.info, peer_ref, &specs, &accepted, save_dir, resumable_id, slot) {
             Ok(session) => {
                 let tokens: IndexMap<String, String> =
                     session.files.lock().unwrap().iter().map(|(id, f)| (id.clone(), f.token.clone())).collect();
@@ -382,6 +469,7 @@ impl ReceiveManager {
             },
         });
         if settings.history_enabled {
+            let (name, kept) = message_history(&text, settings.keep_message_text);
             let entry = NewHistoryEntry {
                 transfer_id: id,
                 direction: Direction::Receive,
@@ -389,11 +477,11 @@ impl ReceiveManager {
                 peer_alias: peer_ref.alias.clone(),
                 peer_kind: peer_ref.device_kind,
                 kind: HistoryKind::Text,
-                name: summarize_text(&text),
+                name,
                 size: text.len() as u64,
                 mime: spec.mime.clone(),
                 path: None,
-                text: settings.keep_message_text.then_some(text),
+                text: kept,
                 timestamp_ms: now_ms(),
                 status: HistoryStatus::Completed,
                 verified: peer.identity.is_verified(),
@@ -405,26 +493,29 @@ impl ReceiveManager {
         empty(StatusCode::NO_CONTENT)
     }
 
-    fn check_capacity(&self, peer: &PeerContext) -> Result<(), Resp> {
-        let key = peer_key(peer.ip.ip);
-        let pending = self.pending.lock().unwrap();
-        if pending.len() >= MAX_PENDING || pending.values().filter(|p| p.key == key).count() >= MAX_PENDING_PER_PEER {
-            return Err(error(StatusCode::CONFLICT, "Blocked by another session"));
+    /// Takes a session slot for this peer, or answers 409 when the peer (or
+    /// everyone together) is at the cap.
+    fn reserve_slot(&self, peer: &PeerContext) -> Result<SessionSlot, Resp> {
+        SessionSlot::reserve(&self.slots, peer_key(peer.ip.ip), MAX_SESSIONS, MAX_SESSIONS_PER_PEER)
+            .ok_or_else(|| error(StatusCode::CONFLICT, "Blocked by another session"))
+    }
+
+    /// Registers a request waiting for its user, unless the peer (or everyone
+    /// together) already has the maximum waiting. Checked and inserted under
+    /// one lock, so simultaneous requests can't all slip under the cap.
+    fn add_pending(&self, id: &str, request: Pending) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len() >= MAX_PENDING || pending.values().filter(|p| p.key == request.key).count() >= MAX_PENDING_PER_PEER {
+            return false;
         }
-        drop(pending);
-        let sessions = self.sessions.lock().unwrap();
-        let live = sessions.values().filter(|s| s.finished_at.lock().unwrap().is_none());
-        let (mut total, mut mine) = (0, 0);
-        for s in live {
-            total += 1;
-            if peer_key(s.peer.ip.ip) == key {
-                mine += 1;
-            }
-        }
-        if total >= MAX_SESSIONS || mine >= MAX_SESSIONS_PER_PEER {
-            return Err(error(StatusCode::CONFLICT, "Blocked by another session"));
-        }
-        Ok(())
+        pending.insert(id.to_string(), request);
+        true
+    }
+
+    /// A session no longer counts against the caps (finished, cancelled, or
+    /// dropped from memory).
+    fn release_slot(session: &Session) {
+        session.slot.lock().unwrap().take();
     }
 
     fn check_space(&self, dir: &Path, needed: u64, alias: &str) -> Result<(), Resp> {
@@ -454,6 +545,7 @@ impl ReceiveManager {
         accepted: &HashSet<String>,
         save_dir: PathBuf,
         ferry_transfer_id: Option<String>,
+        slot: SessionSlot,
     ) -> std::io::Result<Arc<Session>> {
         std::fs::create_dir_all(&save_dir)?;
         // Each transfer's top-level folders get their own (unique) directory,
@@ -502,21 +594,23 @@ impl ReceiveManager {
         } else {
             Some(save_dir.clone())
         };
-        Ok(self.register_session(peer, info, peer_ref, files, save_dir, save_root, ferry_transfer_id, None))
+        let declined = specs
+            .iter()
+            .filter(|s| !accepted.contains(&s.id))
+            .map(|s| InboundOfferedFile {
+                file_id: s.id.clone(),
+                rel_name: s.rel.display(),
+                size: s.size,
+                mime: s.mime.clone(),
+                sha256: s.sha256.clone(),
+            })
+            .collect();
+        let new = NewSession { files, save_dir, save_root, ferry_transfer_id, created_ms: None, declined, manifest_known: true, slot };
+        Ok(self.register_session(peer, info, peer_ref, new))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn register_session(
-        &self,
-        peer: &PeerContext,
-        info: &DeviceDto,
-        peer_ref: PeerRef,
-        files: IndexMap<String, InFile>,
-        save_dir: PathBuf,
-        save_root: Option<PathBuf>,
-        ferry_transfer_id: Option<String>,
-        created_ms: Option<u64>,
-    ) -> Arc<Session> {
+    fn register_session(&self, peer: &PeerContext, info: &DeviceDto, peer_ref: PeerRef, new: NewSession) -> Arc<Session> {
+        let NewSession { files, save_dir, save_root, ferry_transfer_id, created_ms, declined, manifest_known, slot } = new;
         let id = uuid::Uuid::new_v4().to_string();
         let transfer_files: Vec<TransferFile> = files
             .iter()
@@ -539,13 +633,14 @@ impl ReceiveManager {
             files: transfer_files,
             state: TransferState::Transferring,
             resumable: ferry_transfer_id.is_some(),
+            pausable: false,
             text: None,
-            save_dir: save_root.map(|p| p.display().to_string()),
+            save_dir: save_root.as_ref().map(|p| p.display().to_string()),
             connection: Some(ConnectionInfo {
                 transport: "lan".into(),
                 encrypted: peer.identity != PeerIdentity::PlainHttp,
                 ip_version: Some(if peer.ip.ip.is_ipv6() { 6 } else { 4 }),
-                relayed: false,
+                relayed: Some(false),
                 address: Some(peer.ip.to_string()),
             }),
         });
@@ -564,14 +659,24 @@ impl ReceiveManager {
             generation: Default::default(),
             released: tokio::sync::Notify::new(),
             checked_dirs: Mutex::new(HashSet::new()),
+            declined,
+            manifest_known,
+            slot: Mutex::new(Some(slot)),
         });
         if let (Some(fp), Some(tid)) = (peer.identity.fingerprint(), ferry_transfer_id) {
+            // Everything the user approved, so a restart restores the same
+            // constraints (checksums, offer, save folder) rather than trusting
+            // what the sender says when it comes back.
             let record = InboundRecord {
                 peer_fingerprint: fp.to_string(),
                 transfer_id: tid,
                 peer_alias: session.peer_ref.alias.clone(),
                 created_ms: created_ms.unwrap_or_else(now_ms),
                 updated_ms: now_ms(),
+                save_root: Some(session.save_dir.display().to_string()),
+                display_root: save_root.as_ref().map(|p| p.display().to_string()),
+                manifest: session.manifest_known,
+                declined: session.declined.clone(),
                 files: session
                     .files
                     .lock()
@@ -586,6 +691,8 @@ impl ReceiveManager {
                         final_path: f.final_path.as_ref().map(|p| p.display().to_string()),
                         offset: f.offset,
                         done: f.state == InState::Done,
+                        sha256: f.expected_sha256.clone(),
+                        attempts: f.attempts,
                     })
                     .collect(),
             };
@@ -597,68 +704,142 @@ impl ReceiveManager {
         session
     }
 
+    /// Rebuilds the session of a transfer persisted before a restart.
+    /// `Ok(None)`: nothing usable is stored, handle the request as a new one.
+    fn restore_session(
+        &self,
+        peer: &PeerContext,
+        fingerprint: &str,
+        transfer_id: &str,
+        request: &PrepareUploadRequest,
+        specs: &[FileSpec],
+        peer_ref: &PeerRef,
+    ) -> Result<Option<Arc<Session>>, Resp> {
+        let Ok(Some(record)) = self.shared.db.load_inbound(fingerprint, transfer_id) else {
+            return Ok(None);
+        };
+        let default_root = self.shared.settings.get().save_dir();
+        let Some((save_dir, display_root)) = restorable_root(&record, &default_root) else {
+            // The approved folder is gone, or the record points elsewhere:
+            // forget it (never touching files outside the folder) and ask anew.
+            tracing::warn!("Not resuming transfer {transfer_id} from {}: its save folder is no longer usable", peer_ref.alias);
+            let _ = self.shared.db.delete_inbound(fingerprint, transfer_id);
+            return Ok(None);
+        };
+        let approved = approved_files(
+            record.files.iter().map(|f| {
+                (f.file_id.clone(), ApprovedFile { name: f.rel_name.clone(), size: f.size, mime: f.mime.clone(), sha256: f.sha256.clone() })
+            }),
+            &record.declined,
+        );
+        if !reoffer_matches(&approved, record.manifest, specs) {
+            tracing::warn!("Refused to resume transfer {transfer_id} from {}: the files changed", peer_ref.alias);
+            return Err(offer_changed());
+        }
+        let slot = self.reserve_slot(peer)?;
+        let mut files = IndexMap::new();
+        for f in &record.files {
+            // Checked by `restorable_root`.
+            let Ok(rel) = sanitize_relative_path(&f.rel_name) else { return Ok(None) };
+            let part_path = PathBuf::from(&f.part_path);
+            let Some(dest_dir) = part_path.parent().map(Path::to_path_buf) else { return Ok(None) };
+            let on_disk = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+            let metadata = request.files.get(&f.file_id).and_then(|d| d.metadata.clone());
+            let state = if f.done {
+                InState::Done
+            } else if f.attempts >= MAX_ATTEMPTS {
+                InState::Failed
+            } else {
+                InState::Pending
+            };
+            files.insert(
+                f.file_id.clone(),
+                InFile {
+                    token: random_token(),
+                    rel,
+                    size: f.size,
+                    mime: f.mime.clone(),
+                    // The checksum announced when the user approved, never
+                    // whatever the re-offer says.
+                    expected_sha256: f.sha256.clone(),
+                    metadata,
+                    dest_dir,
+                    part_path,
+                    state,
+                    active_cancel: None,
+                    // Never trust more than what is actually on disk.
+                    offset: f.offset.min(on_disk),
+                    attempts: f.attempts,
+                    final_path: f.final_path.as_ref().map(PathBuf::from),
+                    received_sha256: None,
+                    history_id: None,
+                },
+            );
+        }
+        tracing::info!("Resuming transfer {transfer_id} from {}", peer_ref.alias);
+        let new = NewSession {
+            files,
+            save_dir,
+            save_root: Some(display_root),
+            ferry_transfer_id: Some(transfer_id.to_string()),
+            created_ms: Some(record.created_ms),
+            declined: record.declined,
+            manifest_known: record.manifest,
+            slot,
+        };
+        Ok(Some(self.register_session(peer, &request.info, peer_ref.clone(), new)))
+    }
+
     /// Answers a reconnecting Ferry sender without prompting again.
+    ///
+    /// `None` means there is nothing to resume and the request is handled as
+    /// a new one (with its own decision).
     async fn try_resume(
         &self,
         peer: &PeerContext,
         fingerprint: &str,
         transfer_id: &str,
         request: &PrepareUploadRequest,
+        specs: &[FileSpec],
         peer_ref: &PeerRef,
     ) -> Option<Resp> {
-        // Still in memory (the receiver didn't restart)?
-        let existing = self
-            .sessions
-            .lock()
-            .unwrap()
-            .values()
-            .find(|s| s.ferry_transfer_id.as_deref() == Some(transfer_id) && s.peer.identity.fingerprint() == Some(fingerprint))
-            .cloned();
-        let session = match existing {
-            Some(session) => session,
-            None => {
-                let record = self.shared.db.load_inbound(fingerprint, transfer_id).ok()??;
-                let mut files = IndexMap::new();
-                for f in &record.files {
-                    let Ok(rel) = sanitize_relative_path(&f.rel_name) else { continue };
-                    let part_path = PathBuf::from(&f.part_path);
-                    let on_disk = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
-                    let Some(dest_dir) = part_path.parent().map(Path::to_path_buf) else { continue };
-                    let metadata = request.files.get(&f.file_id).and_then(|d| d.metadata.clone());
-                    files.insert(
-                        f.file_id.clone(),
-                        InFile {
-                            token: random_token(),
-                            rel,
-                            size: f.size,
-                            mime: f.mime.clone(),
-                            expected_sha256: None,
-                            metadata,
-                            dest_dir,
-                            part_path,
-                            state: if f.done { InState::Done } else { InState::Pending },
-                            active_cancel: None,
-                            // Never trust more than what is actually on disk.
-                            offset: f.offset.min(on_disk),
-                            attempts: 0,
-                            final_path: f.final_path.as_ref().map(PathBuf::from),
-                            received_sha256: None,
-                            history_id: None,
-                        },
+        let session = {
+            let _restoring = self.restore_lock.lock().unwrap();
+            // Still in memory (the receiver didn't restart)?
+            let existing = self
+                .sessions
+                .lock()
+                .unwrap()
+                .values()
+                .find(|s| s.ferry_transfer_id.as_deref() == Some(transfer_id) && s.peer.identity.fingerprint() == Some(fingerprint))
+                .cloned();
+            match existing {
+                Some(session) => {
+                    let approved = approved_files(
+                        session.files.lock().unwrap().iter().map(|(id, f)| {
+                            (
+                                id.clone(),
+                                ApprovedFile {
+                                    name: f.rel.display(),
+                                    size: f.size,
+                                    mime: f.mime.clone(),
+                                    sha256: f.expected_sha256.clone(),
+                                },
+                            )
+                        }),
+                        &session.declined,
                     );
+                    if !reoffer_matches(&approved, session.manifest_known, specs) {
+                        tracing::warn!("Refused to resume transfer {transfer_id} from {}: the files changed", peer_ref.alias);
+                        return Some(offer_changed());
+                    }
+                    session
                 }
-                let save_dir = self.shared.settings.get().save_dir();
-                tracing::info!("Resuming transfer {transfer_id} from {}", peer_ref.alias);
-                self.register_session(
-                    peer,
-                    &request.info,
-                    peer_ref.clone(),
-                    files,
-                    save_dir.clone(),
-                    Some(save_dir),
-                    Some(transfer_id.to_string()),
-                    Some(record.created_ms),
-                )
+                None => match self.restore_session(peer, fingerprint, transfer_id, request, specs, peer_ref) {
+                    Ok(Some(session)) => session,
+                    Ok(None) => return None,
+                    Err(resp) => return Some(resp),
+                },
             }
         };
         // Uploads from the old connection may not have noticed it died yet.
@@ -1193,7 +1374,15 @@ impl ReceiveManager {
             }
         };
         let offset = f.offset;
+        let attempts = f.attempts;
         drop(files);
+        // Discarded data stays discarded after a restart, and so do the
+        // attempts it used up.
+        if !matches!(as_, ReleaseAs::Pending { .. })
+            && let (Some(fp), Some(tid)) = (session.peer.identity.fingerprint(), &session.ferry_transfer_id)
+        {
+            let _ = self.shared.db.reset_inbound_file(fp, tid, file_id, attempts);
+        }
         session.entry.set_file_state(file_id, state, error_info);
         session.entry.reset_file_progress(file_id, offset);
         if state == FileState::Failed {
@@ -1212,6 +1401,7 @@ impl ReceiveManager {
         }
         *finished = Some(Instant::now());
         drop(finished);
+        Self::release_slot(session);
         let state = session.entry.conclude();
         tracing::info!("Transfer {} from {} finished: {state:?}", session.id, session.peer_ref.alias);
         if let (Some(fp), Some(tid)) = (session.peer.identity.fingerprint(), &session.ferry_transfer_id) {
@@ -1262,9 +1452,9 @@ impl ReceiveManager {
         if let Some(id) = history_id {
             let _ = self.shared.db.delete_history(id);
         }
-        {
+        let attempts = {
             let mut files = session.files.lock().unwrap();
-            if let Some(f) = files.get_mut(file_id.as_str()) {
+            files.get_mut(file_id.as_str()).map(|f| {
                 f.state = InState::Pending;
                 f.offset = 0;
                 f.attempts += 1;
@@ -1273,9 +1463,22 @@ impl ReceiveManager {
                 if f.attempts >= MAX_ATTEMPTS {
                     f.state = InState::Failed;
                 }
+                f.attempts
+            })
+        };
+        if let (Some(attempts), Some(fp), Some(tid)) = (attempts, session.peer.identity.fingerprint(), &session.ferry_transfer_id) {
+            let _ = self.shared.db.reset_inbound_file(fp, tid, file_id, attempts);
+        }
+        let mut finished = session.finished_at.lock().unwrap();
+        if finished.take().is_some() {
+            // Live again: count it again where there is room. It was admitted
+            // already, so a full table doesn't stop the sender's resend.
+            let mut slot = session.slot.lock().unwrap();
+            if slot.is_none() {
+                *slot = SessionSlot::reserve(&self.slots, peer_key(session.peer.ip.ip), MAX_SESSIONS, MAX_SESSIONS_PER_PEER);
             }
         }
-        *session.finished_at.lock().unwrap() = None;
+        drop(finished);
         session.entry.set_file_state(file_id, FileState::Pending, Some(ErrorInfo::checksum_mismatch(file_id)));
         session.entry.reset_file_progress(file_id, 0);
         json(StatusCode::UNPROCESSABLE_ENTITY, &VerifyResponse { ok: false })
@@ -1370,6 +1573,7 @@ impl ReceiveManager {
     fn cancel_session(&self, session: &Arc<Session>, by_peer: bool) {
         session.cancel.cancel();
         self.sessions.lock().unwrap().remove(&session.id);
+        Self::release_slot(session);
         let parts: Vec<PathBuf> =
             session.files.lock().unwrap().values().filter(|f| f.state != InState::Done).map(|f| f.part_path.clone()).collect();
         let mut names = Vec::new();
@@ -1436,6 +1640,7 @@ impl ReceiveManager {
                 if idle > RESUMABLE_IDLE_TIMEOUT {
                     session.cancel.cancel();
                     self.sessions.lock().unwrap().remove(&session.id);
+                    Self::release_slot(&session);
                     session.entry.fail(
                         TransferState::Failed,
                         Some(
@@ -1459,6 +1664,7 @@ impl ReceiveManager {
     fn cancel_session_quietly(&self, session: &Arc<Session>) {
         session.cancel.cancel();
         self.sessions.lock().unwrap().remove(&session.id);
+        Self::release_slot(session);
         for f in session.files.lock().unwrap().values() {
             if f.state != InState::Done {
                 let _ = std::fs::remove_file(&f.part_path);
@@ -1528,10 +1734,246 @@ fn validate_files(files: &IndexMap<String, FileDto>) -> Result<Vec<FileSpec>, &'
     Ok(out)
 }
 
-fn summarize_text(text: &str) -> String {
-    let line: String = text.lines().next().unwrap_or("").chars().take(80).collect();
-    if line.is_empty() { "Message".to_string() } else { line }
+fn approved_files(
+    accepted: impl Iterator<Item = (String, ApprovedFile)>,
+    declined: &[InboundOfferedFile],
+) -> HashMap<String, ApprovedFile> {
+    let mut all: HashMap<String, ApprovedFile> = accepted.collect();
+    for f in declined {
+        all.insert(
+            f.file_id.clone(),
+            ApprovedFile { name: f.rel_name.clone(), size: f.size, mime: f.mime.clone(), sha256: f.sha256.clone() },
+        );
+    }
+    all
+}
+
+/// Whether a resuming sender's offer is the one the user approved. It may
+/// leave files out (a sender re-offers only what it hasn't finished), but
+/// every file it lists must be an approved one with the same name, size and
+/// type, and a checksum may be omitted (the approved one still applies) but
+/// never changed or added. Anything else is refused rather than prompted
+/// for again: a sender re-offering under the same transfer id is supposed
+/// to send the same files.
+///
+/// For records that predate stored offers (`manifest_known` false) the
+/// declined files and checksums are unknown: unknown ids are ignored (they
+/// may have been declined, and get no token either way), and a checksum
+/// counts as added, since none was recorded.
+fn reoffer_matches(approved: &HashMap<String, ApprovedFile>, manifest_known: bool, specs: &[FileSpec]) -> bool {
+    specs.iter().all(|spec| match approved.get(&spec.id) {
+        None => !manifest_known,
+        Some(a) => {
+            a.name == spec.rel.display()
+                && a.size == spec.size
+                && a.mime == spec.mime
+                && match (&a.sha256, &spec.sha256) {
+                    (_, None) => true,
+                    (Some(approved), Some(offered)) => approved.eq_ignore_ascii_case(offered),
+                    (None, Some(_)) => false,
+                }
+        }
+    })
+}
+
+fn offer_changed() -> Resp {
+    error(StatusCode::BAD_REQUEST, "Files differ from the accepted transfer")
+}
+
+/// The folder a persisted transfer may continue in, and the folder shown
+/// for it. The approved folder must still be a directory (it is never
+/// recreated); records from before it was stored use the current default
+/// folder. Every partial and finished file must lie inside it, both by name
+/// and once resolved, or the record is not used at all.
+fn restorable_root(record: &InboundRecord, default_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let root = record.save_root.as_ref().map(PathBuf::from).unwrap_or_else(|| default_root.to_path_buf());
+    if !root.is_absolute() || !std::fs::metadata(&root).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    let real_root = std::fs::canonicalize(&root).ok()?;
+    let inside = |path: &Path| -> bool {
+        let Ok(rest) = path.strip_prefix(&root) else { return false };
+        if rest.as_os_str().is_empty() || !rest.components().all(|c| matches!(c, Component::Normal(_))) {
+            return false;
+        }
+        // What exists of it (the file, else its nearest folder) resolves inside too.
+        path.ancestors().find(|p| p.exists()).and_then(|p| std::fs::canonicalize(p).ok()).is_some_and(|real| real.starts_with(&real_root))
+    };
+    for f in &record.files {
+        let part = Path::new(&f.part_path);
+        let named_part = part.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(PART_SUFFIX));
+        if sanitize_relative_path(&f.rel_name).is_err() || !named_part || !inside(part) {
+            return None;
+        }
+        if f.final_path.as_ref().is_some_and(|p| !inside(Path::new(p))) {
+            return None;
+        }
+    }
+    let display = match record.display_root.as_ref().map(PathBuf::from) {
+        Some(d) if d == root || inside(&d) => d,
+        _ => root.clone(),
+    };
+    Some((root, display))
 }
 
 #[allow(unused)]
 fn _assert_bytes(_: Bytes) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::from([192, 168, 1, n])
+    }
+
+    #[test]
+    fn session_slots_hold_both_caps_and_free_on_drop() {
+        let table = Arc::new(Mutex::new(SlotTable::default()));
+        let take = |n| SessionSlot::reserve(&table, ip(n), MAX_SESSIONS, MAX_SESSIONS_PER_PEER);
+        let mut held: Vec<SessionSlot> = (0..MAX_SESSIONS_PER_PEER).map(|_| take(1).unwrap()).collect();
+        assert!(take(1).is_none(), "per-peer cap");
+        // Several peers fill the rest of the table.
+        let mut peer = 2;
+        while held.len() < MAX_SESSIONS {
+            match take(peer) {
+                Some(slot) => held.push(slot),
+                None => peer += 1,
+            }
+        }
+        assert!(take(200).is_none(), "global cap, even for a new peer");
+        held.remove(0);
+        held.push(take(1).expect("a freed slot is reused"));
+        assert!(take(200).is_none(), "full again");
+        held.pop();
+        held.pop();
+        let again = take(200).expect("a slot freed by another peer is free for anyone");
+        drop(again);
+        drop(held);
+        let t = table.lock().unwrap();
+        assert_eq!(t.total, 0);
+        assert!(t.per_peer.is_empty());
+    }
+
+    fn spec(id: &str, name: &str, size: u64, sha256: Option<&str>) -> FileSpec {
+        FileSpec {
+            id: id.into(),
+            rel: sanitize_relative_path(name).unwrap(),
+            size,
+            mime: "application/octet-stream".into(),
+            sha256: sha256.map(str::to_string),
+            preview: None,
+            metadata: None,
+        }
+    }
+
+    fn approved(entries: &[(&str, &str, u64, Option<&str>)]) -> HashMap<String, ApprovedFile> {
+        entries
+            .iter()
+            .map(|(id, name, size, sha)| {
+                let file = ApprovedFile {
+                    name: name.to_string(),
+                    size: *size,
+                    mime: "application/octet-stream".into(),
+                    sha256: sha.map(str::to_string),
+                };
+                (id.to_string(), file)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reoffer_must_match_the_approved_offer() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let ok = approved(&[("1", "x.bin", 10, Some(&a)), ("2", "Album/y.bin", 20, None)]);
+        // The same files, a subset, an omitted checksum, another case.
+        assert!(reoffer_matches(&ok, true, &[spec("1", "x.bin", 10, Some(&a)), spec("2", "Album/y.bin", 20, None)]));
+        assert!(reoffer_matches(&ok, true, &[spec("2", "Album/y.bin", 20, None)]));
+        assert!(reoffer_matches(&ok, true, &[spec("1", "x.bin", 10, None)]));
+        assert!(reoffer_matches(&ok, true, &[spec("1", "x.bin", 10, Some(&a.to_uppercase()))]));
+        // Changed name, size, type, checksum; a checksum where none was approved; a new file.
+        assert!(!reoffer_matches(&ok, true, &[spec("1", "z.bin", 10, None)]));
+        assert!(!reoffer_matches(&ok, true, &[spec("1", "x.bin", 11, None)]));
+        let mut typed = spec("1", "x.bin", 10, None);
+        typed.mime = "text/plain".into();
+        assert!(!reoffer_matches(&ok, true, &[typed]));
+        assert!(!reoffer_matches(&ok, true, &[spec("1", "x.bin", 10, Some(&b))]));
+        assert!(!reoffer_matches(&ok, true, &[spec("2", "Album/y.bin", 20, Some(&b))]));
+        assert!(!reoffer_matches(&ok, true, &[spec("3", "new.bin", 1, None)]));
+        // A legacy record doesn't know declined files: unknown ids are let
+        // through (they get no token), known ones are still held to the record.
+        assert!(reoffer_matches(&ok, false, &[spec("3", "new.bin", 1, None)]));
+        assert!(!reoffer_matches(&ok, false, &[spec("1", "x.bin", 99, None)]));
+    }
+
+    fn record(root: Option<&Path>, parts: &[PathBuf]) -> InboundRecord {
+        InboundRecord {
+            peer_fingerprint: "FP".into(),
+            transfer_id: "T".into(),
+            peer_alias: "Laptop".into(),
+            created_ms: 0,
+            updated_ms: 0,
+            files: parts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| InboundFileRecord {
+                    file_id: i.to_string(),
+                    rel_name: "f.bin".into(),
+                    size: 10,
+                    mime: "application/octet-stream".into(),
+                    part_path: p.display().to_string(),
+                    final_path: None,
+                    offset: 0,
+                    done: false,
+                    sha256: None,
+                    attempts: 0,
+                })
+                .collect(),
+            save_root: root.map(|r| r.display().to_string()),
+            display_root: None,
+            manifest: true,
+            declined: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restored_files_must_stay_in_the_approved_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("Album")).unwrap();
+        let good = [r.join("f.bin.abc123.ferrypart"), r.join("Album/sub/f.bin.abc123.ferrypart")];
+        let (got, display) = restorable_root(&record(Some(r), &good), other.path()).unwrap();
+        assert_eq!((got.as_path(), display.as_path()), (r, r));
+
+        for bad in [
+            other.path().join("f.bin.abc123.ferrypart"),
+            r.join("..").join(other.path().file_name().unwrap()).join("f.bin.abc123.ferrypart"),
+            r.join("f.bin"),
+            PathBuf::from(format!("f.bin{PART_SUFFIX}")),
+        ] {
+            assert!(restorable_root(&record(Some(r), std::slice::from_ref(&bad)), other.path()).is_none(), "{bad:?}");
+        }
+        // A missing or non-folder root is not recreated.
+        let gone = r.join("gone");
+        assert!(restorable_root(&record(Some(&gone), &[gone.join("f.bin.abc123.ferrypart")]), r).is_none());
+        assert!(!gone.exists());
+        std::fs::write(r.join("file"), b"x").unwrap();
+        assert!(restorable_root(&record(Some(&r.join("file")), &[r.join("file/f.bin.abc123.ferrypart")]), r).is_none());
+
+        // Legacy records: the current default folder, only when it holds the files.
+        assert_eq!(restorable_root(&record(None, &good), r).unwrap().0, r);
+        assert!(restorable_root(&record(None, &good), other.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_files_may_not_leave_the_folder_through_a_link() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(other.path(), root.path().join("Album")).unwrap();
+        let part = root.path().join("Album/f.bin.abc123.ferrypart");
+        assert!(restorable_root(&record(Some(root.path()), &[part]), other.path()).is_none());
+    }
+}

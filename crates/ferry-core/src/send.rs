@@ -10,7 +10,7 @@ use crate::model::*;
 use crate::proto::*;
 use crate::shared::Shared;
 use crate::transfer::{NewTransfer, TransferEntry};
-use crate::util::now_ms;
+use crate::util::{message_history, now_ms};
 use bytes::Bytes;
 use indexmap::IndexMap;
 use std::collections::HashSet;
@@ -173,6 +173,8 @@ impl SendManager {
                 .collect(),
             state: TransferState::Preparing,
             resumable: false,
+            // LAN sends pause and resume once the receiver is known to resume.
+            pausable: true,
             text,
             save_dir: None,
             connection: None,
@@ -242,7 +244,7 @@ impl SendManager {
     /// Pauses a resumable transfer (current uploads stop; data so far is kept).
     pub fn pause(&self, id: &str) -> bool {
         let Some(out) = self.outgoing.lock().unwrap().get(id).cloned() else { return false };
-        if !out.entry.summary().resumable || out.entry.state().is_final() {
+        if !out.entry.summary().can_pause || out.entry.state().is_final() {
             return false;
         }
         *out.paused.lock().unwrap() = true;
@@ -867,7 +869,8 @@ impl SendManager {
     }
 
     fn finish_history(&self, out: &Arc<Outgoing>) {
-        if !self.shared.settings.get().history_enabled {
+        let settings = self.shared.settings.get();
+        if !settings.history_enabled {
             return;
         }
         let peer = out.entry.peer();
@@ -880,23 +883,22 @@ impl SendManager {
                 _ if state == TransferState::Cancelled => HistoryStatus::Cancelled,
                 _ => HistoryStatus::Failed,
             };
-            let is_text = src.text.is_some();
+            let (name, text) = match &src.text {
+                Some(t) => message_history(t, settings.keep_message_text),
+                None => (src.name.clone(), None),
+            };
             let entry = NewHistoryEntry {
                 transfer_id: out.id.clone(),
                 direction: Direction::Send,
                 peer_id: peer.id.clone(),
                 peer_alias: peer.alias.clone(),
                 peer_kind: peer.device_kind,
-                kind: if is_text { HistoryKind::Text } else { HistoryKind::File },
-                name: if is_text {
-                    src.text.as_deref().map(|t| t.chars().take(80).collect()).unwrap_or_default()
-                } else {
-                    src.name.clone()
-                },
+                kind: if src.text.is_some() { HistoryKind::Text } else { HistoryKind::File },
+                name,
                 size: src.size,
                 mime: src.mime.clone(),
                 path: src.path.as_ref().map(|p| p.display().to_string()),
-                text: None,
+                text,
                 timestamp_ms: now_ms(),
                 status,
                 verified: false,
@@ -913,7 +915,7 @@ fn set_connection(entry: &TransferEntry, addr: &PeerAddress) {
         transport: "lan".into(),
         encrypted: addr.protocol == Protocol::Https,
         ip_version: Some(addr.ip_version()),
-        relayed: false,
+        relayed: Some(false),
         address: Some(addr.display()),
     });
 }

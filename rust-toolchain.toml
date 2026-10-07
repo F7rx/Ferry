@@ -1,0 +1,5 @@
+# Local builds and CI use the same toolchain. Keep in sync with
+# `rust-version` in Cargo.toml and the toolchain in .github/workflows.
+[toolchain]
+channel = "1.97"
+components = ["rustfmt", "clippy"]

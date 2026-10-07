@@ -5,11 +5,11 @@ use crate::db::Db;
 use crate::devices::DeviceDirectory;
 use crate::discovery::Discovery;
 use crate::error::{ErrorInfo, Result};
-use crate::events::{EngineEvent, EventBus, NoticeLevel};
+use crate::events::{EngineEvent, EventBus, NoticeLevel, ServerStatus};
 use crate::identity::Identity;
 use crate::model::*;
 use crate::net::interfaces;
-use crate::pairing::{OutgoingPairing, PairingManager, PairingOffer};
+use crate::pairing::{OutgoingPairing, PairingManager, PairingOffer, PairingRequest};
 use crate::receive::ReceiveManager;
 use crate::rtc::manager::{DEVICE_PREFIX, RtcManager};
 use crate::send::{SendItem, SendManager, Target};
@@ -17,6 +17,7 @@ use crate::server::{self, Routes, ServerHandle, ServerSignal};
 use crate::settings::{Settings, SettingsStore};
 use crate::shared::{NetState, Shared};
 use crate::transfer::TransferRegistry;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -44,6 +45,24 @@ impl EngineConfig {
     pub fn ephemeral(settings: Settings) -> Self {
         EngineConfig { data_dir: None, settings_override: Some(settings), discovery: false }
     }
+}
+
+/// The engine's whole visible state at one moment (see `Engine::snapshot`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineSnapshot {
+    pub local: LocalDevice,
+    pub devices: Vec<DeviceSummary>,
+    pub transfers: Vec<TransferSummary>,
+    pub settings: Settings,
+    pub server: ServerStatus,
+    /// Incoming requests still waiting for a decision.
+    pub pending_requests: Vec<IncomingRequest>,
+    /// Pairing prompts still waiting for an answer.
+    pub pairing_requests: Vec<PairingRequest>,
+    pub rooms: Vec<RoomInfo>,
+    pub signaling: SignalingStatus,
+    pub browser_links: Vec<BrowserShareInfo>,
 }
 
 pub struct Engine {
@@ -218,6 +237,38 @@ impl Engine {
 
     pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
         self.shared.events.subscribe()
+    }
+
+    /// Everything a shell renders, read now. A subscriber that lagged (or one
+    /// starting up) replaces its state with this, then applies later events.
+    pub fn snapshot(&self) -> EngineSnapshot {
+        EngineSnapshot {
+            local: self.local_device(),
+            devices: self.devices(),
+            transfers: self.transfers(),
+            settings: self.settings(),
+            server: self.server_status(),
+            pending_requests: self.pending_requests(),
+            pairing_requests: self.pairing_requests(),
+            rooms: self.rooms(),
+            signaling: self.signaling_status(),
+            browser_links: self.browser_links(),
+        }
+    }
+
+    /// Incoming requests waiting for `respond`, oldest first.
+    pub fn pending_requests(&self) -> Vec<IncomingRequest> {
+        self.shared.events.pending_requests()
+    }
+
+    /// Pairing prompts waiting for `respond_pairing`, oldest first.
+    pub fn pairing_requests(&self) -> Vec<PairingRequest> {
+        self.shared.events.pairing_requests()
+    }
+
+    /// Whether the receiving server runs, on which port, or why not.
+    pub fn server_status(&self) -> ServerStatus {
+        self.shared.events.server_status().unwrap_or_else(|| ServerStatus { running: false, port: self.port(), error: None })
     }
 
     pub fn local_device(&self) -> LocalDevice {

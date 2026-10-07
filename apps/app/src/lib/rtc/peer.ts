@@ -64,8 +64,8 @@ export interface PeerConnectorEvents {
    * cancelled it, the decision timed out ("timeout") or the connector was disposed.
    */
   withdrawn: { peerId: string; sessionId: string; reason: string };
-  /** A session was created (fired before its handshake runs). */
-  session: { session: PeerSession; peerId: string; role: Role };
+  /** A session was created (fired before its handshake runs). `connection` carries it (for `getStats`). */
+  session: { session: PeerSession; peerId: string; role: Role; connection: RTCPeerConnection | null };
 }
 
 interface Entry {
@@ -264,7 +264,7 @@ export class PeerConnector extends Emitter<PeerConnectorEvents> {
     });
     entry.session = session;
     session.on("closed", () => this.cleanup(entry));
-    this.emit("session", { session, peerId: entry.peerId, role });
+    this.emit("session", { session, peerId: entry.peerId, role, connection: entry.pc });
     return session;
   }
 

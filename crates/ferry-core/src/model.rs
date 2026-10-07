@@ -229,8 +229,9 @@ pub struct ConnectionInfo {
     pub transport: String,
     pub encrypted: bool,
     pub ip_version: Option<u8>,
-    /// WebRTC through a TURN relay (still end-to-end encrypted).
-    pub relayed: bool,
+    /// WebRTC through a TURN relay (still end-to-end encrypted); `None` when
+    /// the route isn't known (no selected ICE candidate pair yet).
+    pub relayed: Option<bool>,
     pub address: Option<String>,
 }
 
@@ -271,8 +272,15 @@ pub struct TransferSummary {
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
     pub connection: Option<ConnectionInfo>,
-    /// Pause/resume and reconnect-after-restart are available.
+    /// The transfer continues where it stopped after a lost connection or a
+    /// restart. Separate from the user actions below.
     pub resumable: bool,
+    /// The user can pause it while it is transferring.
+    #[serde(default)]
+    pub can_pause: bool,
+    /// The user can resume it once paused.
+    #[serde(default)]
+    pub can_resume: bool,
     /// The first file's name (cards show "photo.jpg and 7 more").
     pub title: String,
     /// For text messages.
@@ -394,4 +402,20 @@ pub struct SignalingStatus {
     pub error: Option<String>,
     /// This device's WebRTC identity key (base64url Ed25519).
     pub identity_key: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionInfo;
+
+    #[test]
+    fn an_unknown_route_is_null_not_direct() {
+        let lan = ConnectionInfo { transport: "lan".into(), encrypted: true, ip_version: Some(4), relayed: Some(false), address: None };
+        assert_eq!(serde_json::to_value(&lan).unwrap()["relayed"], serde_json::json!(false));
+        let unknown = ConnectionInfo { transport: "webrtc".into(), relayed: None, ..lan };
+        assert_eq!(serde_json::to_value(&unknown).unwrap()["relayed"], serde_json::Value::Null);
+        // JSON without the field still reads.
+        let old: ConnectionInfo = serde_json::from_str(r#"{"transport":"lan","encrypted":true,"ipVersion":4,"address":null}"#).unwrap();
+        assert_eq!(old.relayed, None);
+    }
 }

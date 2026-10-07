@@ -78,6 +78,10 @@ export type {
 export { PeerConnector } from "./peer";
 export type { ConnectOptions, IncomingConnection, PeerConnectorEvents, PeerConnectorOptions } from "./peer";
 
+// Direct or relayed (from the selected ICE candidate pair)
+export { relayedOf } from "./route";
+export type { StatsSource } from "./route";
+
 // Session (§5.2)
 export { PeerSession } from "./session";
 export type {

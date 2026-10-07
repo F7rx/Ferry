@@ -80,7 +80,7 @@ async fn native_peers_connect_through_signaling() {
         .await
         .unwrap();
     let mut answered = answering.await.unwrap().unwrap();
-    eprintln!("connected in {:?}, relayed={} remote={:?}", started.elapsed(), connected.relayed, connected.remote_address);
+    eprintln!("connected in {:?}, relayed={:?} remote={:?}", started.elapsed(), connected.relayed, connected.remote_address);
     assert_eq!(connected.session.peer().unwrap().key, b.identity.public_key());
     assert_eq!(answered.session.peer().unwrap().short_code, connected.session.peer().unwrap().short_code);
 

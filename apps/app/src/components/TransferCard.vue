@@ -3,7 +3,7 @@ import { computed, ref } from "vue";
 import { ArrowDownLeft, ArrowUpRight, Check, ChevronDown, CircleAlert, FolderOpen, KeyRound, Lock, LockOpen, Pause, Play, RotateCw, X } from "@lucide/vue";
 import type { TransferSummary } from "../platform";
 import { platform } from "../platform";
-import { attempt, loadFiles, store } from "../stores/engine";
+import { attempt, loadFiles, store, toast } from "../stores/engine";
 import { fileIcon } from "../lib/icons";
 import { formatBytes, formatEta, formatSpeed } from "../lib/format";
 import FButton from "./FButton.vue";
@@ -64,7 +64,9 @@ const connection = computed(() => {
   const c = t.value.connection;
   if (!c) return null;
   // WebRTC may well be on the same network; say how it travels, not where.
-  const where = c.transport === "webrtc" ? (c.relayed ? "Peer-to-peer · Relayed" : "Peer-to-peer") : "Nearby";
+  // Direct or relayed only when known (null: the route wasn't reported).
+  const route = c.relayed === true ? " · Relayed" : c.relayed === false ? " · Direct" : "";
+  const where = c.transport === "webrtc" ? `Peer-to-peer${route}` : "Nearby";
   const ip = c.ipVersion ? ` · IPv${c.ipVersion}` : "";
   return { label: `${where}${ip}`, encrypted: c.encrypted };
 });
@@ -77,12 +79,27 @@ async function toggle() {
   if (expanded.value) await loadFiles(t.value.id);
 }
 const act = (fn: () => Promise<unknown>) => attempt(fn);
-const pause = () => act(() => platform.pause(t.value.id));
-const resume = () => act(() => platform.resume(t.value.id));
+/** Runs a pause or resume; `false` means the transfer couldn't do it (errors already show a toast). */
+async function control(fn: () => Promise<boolean>, failure: string) {
+  if ((await attempt(fn)) === false) toast({ level: "error", title: failure });
+}
+const pause = () => control(() => platform.pause(t.value.id), "Couldn't pause the transfer");
+const resume = () => control(() => platform.resume(t.value.id), "Couldn't resume the transfer");
 // Browser app: a send that lost its connection continues where it stopped.
+// Never offered for a decline, a cancel or any other failure.
 const canRetry = computed(
   () => platform.capabilities.kind === "web" && t.value.direction === "send" && t.value.state === "failed" && t.value.error?.code === "connection_lost",
 );
+const retrying = ref(false);
+async function retry() {
+  if (retrying.value) return;
+  retrying.value = true;
+  try {
+    await control(() => platform.resume(t.value.id), "Couldn't try again");
+  } finally {
+    retrying.value = false;
+  }
+}
 const cancel = () => act(() => platform.cancel(t.value.id));
 const dismiss = () => act(() => platform.dismiss(t.value.id));
 const reveal = () => t.value.saveDir && act(() => platform.reveal(t.value.saveDir!));
@@ -119,12 +136,12 @@ async function submitPin() {
 
       <div class="buttons">
         <template v-if="!final">
-          <FButton v-if="t.resumable && t.state === 'transferring'" variant="ghost" size="sm" icon-only :icon="Pause" label="Pause" @click="pause" />
-          <FButton v-if="t.state === 'paused'" variant="ghost" size="sm" icon-only :icon="Play" label="Resume" @click="resume" />
-          <FButton v-if="canRetry" variant="ghost" size="sm" icon-only :icon="RotateCw" label="Try again" @click="resume" />
+          <FButton v-if="t.canPause && t.state === 'transferring'" variant="ghost" size="sm" icon-only :icon="Pause" label="Pause" @click="pause" />
+          <FButton v-if="t.canResume && t.state === 'paused'" variant="ghost" size="sm" icon-only :icon="Play" label="Resume" @click="resume" />
           <FButton variant="ghost" size="sm" icon-only :icon="X" label="Cancel" @click="cancel" />
         </template>
         <template v-else>
+          <FButton v-if="canRetry" variant="ghost" size="sm" icon-only :icon="RotateCw" label="Try again" :disabled="retrying" @click="retry" />
           <FButton
             v-if="done && t.direction === 'receive' && t.saveDir && canReveal"
             variant="ghost"

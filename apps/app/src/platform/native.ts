@@ -1,4 +1,5 @@
 // Native (Tauri) platform: the Rust engine runs in-process; we talk to it over IPC.
+import { reactive } from "vue";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -47,6 +48,7 @@ async function pathItems(paths: string[]): Promise<OutgoingItem[]> {
 }
 
 export function createNativePlatform(): Platform & {
+  takePendingPaths(): Promise<string[]>;
   onDrag(handler: (e: NativeDragEvent) => void): () => void;
   onPaths(handler: (items: OutgoingItem[]) => void): () => void;
   pathItems: typeof pathItems;
@@ -66,26 +68,49 @@ export function createNativePlatform(): Platform & {
     remoteLinks: true,
   };
 
+  // Received files the shell granted to the asset protocol (as history spells
+  // them). Reactive, so a preview appears once its grant arrives.
+  const previewable = reactive(new Set<string>());
+  const allowPreviews = (paths: string[]) => paths.forEach((p) => previewable.add(p));
+
+  // Launch paths wait in the shell's queue until taken: first by the startup
+  // handoff (main.ts), then by `onPaths` whenever the shell announces more and
+  // once its listener is up (a launch may beat the window). Taking, not the
+  // event's payload, delivers them, so none is lost and none arrives twice.
+  let handOff!: () => void;
+  const handedOff = new Promise<void>((resolve) => (handOff = resolve));
+
   return {
     capabilities,
     pathItems,
 
-    async init() {
-      const snap = await invoke<Snapshot & { pendingPaths: string[] }>("snapshot");
-      return snap;
+    init: () => invoke<Snapshot>("snapshot"),
+
+    /** Launch paths ("Send with Ferry", command line): handed over once. */
+    async takePendingPaths() {
+      try {
+        return await invoke<string[]>("take_pending_paths");
+      } finally {
+        handOff();
+      }
     },
 
-    subscribe(handler) {
-      let unlisten: UnlistenFn | null = null;
-      let disposed = false;
-      listen<EngineEvent>("ferry://event", (e) => handler(e.payload)).then((u) => {
-        if (disposed) u();
-        else unlisten = u;
-      });
-      return () => {
-        disposed = true;
-        unlisten?.();
-      };
+    async subscribe(handler, onResync) {
+      // All listeners are installed before this resolves, so the snapshot
+      // that follows can't miss an event.
+      const installed = await Promise.allSettled([
+        listen<EngineEvent>("ferry://event", (e) => handler(e.payload)),
+        listen<null>("ferry://resync", () => onResync?.()),
+        listen<string[]>("ferry://previewable", (e) => allowPreviews(e.payload)),
+      ]);
+      const unlisten = installed.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+      const failed = installed.find((r) => r.status === "rejected");
+      const stop = () => unlisten.splice(0).forEach((u: UnlistenFn) => u());
+      if (failed) {
+        stop();
+        throw failed.reason;
+      }
+      return stop;
     },
 
     onDrag(handler) {
@@ -112,8 +137,24 @@ export function createNativePlatform(): Platform & {
 
     onPaths(handler) {
       let unlisten: UnlistenFn | null = null;
-      listen<string[]>("ferry://paths", async (e) => handler(await pathItems(e.payload))).then((u) => (unlisten = u));
-      return () => unlisten?.();
+      let disposed = false;
+      const drain = async () => {
+        // The startup handoff takes what launched the app first.
+        await handedOff;
+        if (disposed) return;
+        const paths = await invoke<string[]>("take_pending_paths");
+        if (paths.length) handler(await pathItems(paths));
+      };
+      const take = () => void drain().catch((err) => console.error("Couldn't take the files Ferry was opened with", err));
+      listen<string[]>("ferry://paths", take).then((u) => {
+        if (disposed) return u();
+        unlisten = u;
+        take();
+      });
+      return () => {
+        disposed = true;
+        unlisten?.();
+      };
     },
 
     async send(targets: SendTarget[], items: OutgoingItem[]) {
@@ -149,8 +190,15 @@ export function createNativePlatform(): Platform & {
     respondPairing: (requestId, accept) => invoke<boolean>("respond_pairing", { requestId, accept }),
     unpairDevice: (id) => invoke<DeviceSummary | null>("unpair_device", { id }),
 
-    history: (limit, beforeId, direction?: Direction) =>
-      invoke<HistoryEntry[]>("history", { limit, beforeId: beforeId ?? null, direction: direction ?? null }),
+    async history(limit, beforeId, direction?: Direction) {
+      const page = await invoke<{ entries: HistoryEntry[]; previewable: string[] }>("history", {
+        limit,
+        beforeId: beforeId ?? null,
+        direction: direction ?? null,
+      });
+      allowPreviews(page.previewable);
+      return page.entries;
+    },
     deleteHistory: (id) => invoke<boolean>("delete_history", { id }),
     clearHistory: () => invoke<void>("clear_history"),
 
@@ -191,7 +239,9 @@ export function createNativePlatform(): Platform & {
     copyText: (text) => writeText(text),
     open: (path) => invoke<void>("open_path", { path }),
     reveal: (path) => invoke<void>("reveal_path", { path }),
-    previewUrl: (path) => convertFileSrc(path),
+    // Only files the shell validated and granted; anything else would be
+    // refused by the asset protocol anyway.
+    previewUrl: (path) => (previewable.has(path) ? convertFileSrc(path) : null),
     async notify(title, body) {
       let granted = await isPermissionGranted();
       if (!granted) granted = (await requestPermission()) === "granted";

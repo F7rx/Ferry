@@ -29,6 +29,6 @@ pub mod util;
 
 pub use error::{ErrorInfo, FerryError, Result};
 
-pub use engine::{Engine, EngineConfig};
+pub use engine::{Engine, EngineConfig, EngineSnapshot};
 pub use send::{SendItem, Target};
 pub use settings::Settings;

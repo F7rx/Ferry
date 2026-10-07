@@ -37,6 +37,8 @@ struct Meta {
     finished_at_ms: Option<u64>,
     connection: Option<ConnectionInfo>,
     resumable: bool,
+    /// The user can pause and resume it (once `resumable`).
+    pausable: bool,
     text: Option<String>,
     save_dir: Option<String>,
 }
@@ -56,7 +58,7 @@ impl TransferEntry {
     /// Takes one lock at a time (meta, files, speed, never nested), so it
     /// can't deadlock with the ticker or with per-file updates.
     pub fn summary(&self) -> TransferSummary {
-        let (peer, state, finished_at_ms, connection, resumable, text, error, save_dir) = {
+        let (peer, state, finished_at_ms, connection, resumable, pausable, text, error, save_dir) = {
             let m = self.meta.lock().unwrap();
             (
                 m.peer.clone(),
@@ -64,6 +66,7 @@ impl TransferEntry {
                 m.finished_at_ms,
                 m.connection.clone(),
                 m.resumable,
+                m.pausable && m.resumable,
                 m.text.clone(),
                 m.error.clone(),
                 m.save_dir.clone(),
@@ -98,6 +101,8 @@ impl TransferEntry {
             finished_at_ms,
             connection,
             resumable,
+            can_pause: pausable,
+            can_resume: pausable,
             title,
             text,
             error,
@@ -270,6 +275,8 @@ pub struct NewTransfer {
     pub files: Vec<TransferFile>,
     pub state: TransferState,
     pub resumable: bool,
+    /// Whether the user can pause and resume it once it is resumable (LAN sends only).
+    pub pausable: bool,
     pub text: Option<String>,
     pub save_dir: Option<String>,
     pub connection: Option<ConnectionInfo>,
@@ -302,6 +309,7 @@ impl TransferRegistry {
                 finished_at_ms: None,
                 connection: t.connection,
                 resumable: t.resumable,
+                pausable: t.pausable,
                 text: t.text,
                 save_dir: t.save_dir,
             }),
@@ -483,6 +491,7 @@ mod tests {
             files: (0..2_000).map(file).collect(),
             state: TransferState::Transferring,
             resumable: false,
+            pausable: false,
             text: None,
             save_dir: None,
             connection: None,
@@ -535,6 +544,7 @@ mod tests {
             files: (0..3).map(file).collect(),
             state: TransferState::Transferring,
             resumable: true,
+            pausable: true,
             text: None,
             save_dir: None,
             connection: None,
@@ -564,6 +574,7 @@ mod tests {
             files: (0..2).map(file).collect(),
             state: TransferState::Transferring,
             resumable: true,
+            pausable: true,
             text: None,
             save_dir: None,
             connection: None,

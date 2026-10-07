@@ -8,7 +8,8 @@ import Toasts from "./components/Toasts.vue";
 import { native, platform, web, type OutgoingItem } from "./platform";
 import { compose, sendNow, stage } from "./stores/compose";
 import { itemsFromDataTransfer } from "./lib/dropfiles";
-import { activeTransfers, store } from "./stores/engine";
+import { activeTransfers, initEngine, store } from "./stores/engine";
+import FButton from "./components/FButton.vue";
 import { pulse } from "./lib/motion";
 
 const router = useRouter();
@@ -138,7 +139,13 @@ const isDemo = platform.capabilities.kind === "demo";
     <a href="#main" class="skip">Skip to content</a>
     <NavRail v-if="layout !== 'mobile'" :collapsed="layout === 'tablet'" />
     <main id="main" class="content scroll" tabindex="-1">
-      <div v-if="!store.ready" class="loading" role="status">Starting Ferry…</div>
+      <div v-if="!store.ready" class="loading" role="status">
+        <div v-if="store.syncError" class="load-failed">
+          <span>Ferry couldn't start: {{ store.syncError }}</span>
+          <FButton variant="primary" @click="initEngine()">Retry</FButton>
+        </div>
+        <template v-else>Starting Ferry…</template>
+      </div>
       <RouterView v-else v-slot="{ Component, route: r }">
         <Transition name="page" mode="out-in">
           <component :is="Component" :key="r.path" />
@@ -180,6 +187,14 @@ const isDemo = platform.capabilities.kind === "demo";
   place-items: center;
   height: 100%;
   color: var(--text-3);
+}
+.load-failed {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  max-width: 420px;
+  padding: 0 16px;
+  text-align: center;
 }
 .skip {
   position: fixed;

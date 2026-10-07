@@ -188,6 +188,9 @@ export function createDemoPlatform(): Platform & { trigger(scene: string): void 
       finishedAtMs: null,
       connection: { transport: "lan", encrypted: peer.protocol === "https", ipVersion: 4, relayed: false, address: peer.address },
       resumable: peer.isFerry,
+      // Like the native app: sends to Ferry devices can be paused; receives can't.
+      canPause: direction === "send" && peer.isFerry,
+      canResume: direction === "send" && peer.isFerry,
       title: items[0]?.name ?? "Message",
       text: null,
       error: null,
@@ -252,12 +255,14 @@ export function createDemoPlatform(): Platform & { trigger(scene: string): void 
     },
     async pause(id) {
       const t = transfers.get(id);
-      if (t) t.state = "paused";
+      if (!t?.canPause || t.state !== "transferring") return false;
+      t.state = "paused";
       return true;
     },
     async resume(id) {
       const t = transfers.get(id);
-      if (t) t.state = "transferring";
+      if (!t?.canResume || t.state !== "paused") return false;
+      t.state = "transferring";
       return true;
     },
     async submitPin() {

@@ -5,41 +5,36 @@ use ferry_core::diagnostics::DiagnosticCheck;
 use ferry_core::events::EngineEvent;
 use ferry_core::model::*;
 use ferry_core::pairing::{OutgoingPairing, PairingOffer};
-use ferry_core::{Engine, EngineConfig, ErrorInfo, SendItem, Settings, Target};
+use ferry_core::{Engine, EngineConfig, EngineSnapshot, ErrorInfo, SendItem, Settings, Target};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 
+pub mod preview;
+
 const EVENT: &str = "ferry://event";
+/// Events were dropped (the UI fell behind): it reloads the snapshot.
+const RESYNC: &str = "ferry://resync";
+/// Received files the UI may now preview (paths as history spells them).
+const PREVIEWABLE: &str = "ferry://previewable";
 
 struct AppState {
     engine: Arc<Engine>,
-    server: Mutex<ServerState>,
-    /// Paths handed to us on the command line / by a second instance.
+    /// Paths handed to us on the command line (this launch or a later one),
+    /// taken once by the UI.
     pending_paths: Mutex<Vec<String>>,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ServerState {
-    running: bool,
-    port: u16,
-    error: Option<String>,
-}
-
+/// A page of history, plus which of its files the UI may preview.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Snapshot {
-    local: LocalDevice,
-    devices: Vec<DeviceSummary>,
-    transfers: Vec<TransferSummary>,
-    settings: Settings,
-    server: ServerState,
-    pending_paths: Vec<String>,
+struct HistoryPage {
+    entries: Vec<HistoryEntry>,
+    previewable: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -70,17 +65,11 @@ fn info(err: ferry_core::FerryError) -> ErrorInfo {
     err.info()
 }
 
+/// The engine's whole state, read on startup and after `ferry://resync`. It
+/// never carries launch paths, so reloading it can't take or repeat them.
 #[tauri::command]
-fn snapshot(state: State<'_, AppState>) -> Snapshot {
-    let engine = &state.engine;
-    Snapshot {
-        local: engine.local_device(),
-        devices: engine.devices(),
-        transfers: engine.transfers(),
-        settings: engine.settings(),
-        server: state.server.lock().unwrap().clone(),
-        pending_paths: std::mem::take(&mut *state.pending_paths.lock().unwrap()),
-    }
+fn snapshot(state: State<'_, AppState>) -> EngineSnapshot {
+    state.engine.snapshot()
 }
 
 #[tauri::command]
@@ -233,9 +222,35 @@ fn forget_device(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     state.engine.forget_device(&id).map_err(info)
 }
 
+// Async: checking each file on disk stays off the main thread.
 #[tauri::command]
-fn history(state: State<'_, AppState>, limit: u32, before_id: Option<i64>, direction: Option<Direction>) -> CmdResult<Vec<HistoryEntry>> {
-    state.engine.history(limit, before_id, direction).map_err(info)
+async fn history(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    limit: u32,
+    before_id: Option<i64>,
+    direction: Option<Direction>,
+) -> CmdResult<HistoryPage> {
+    let entries = state.engine.history(limit, before_id, direction).map_err(info)?;
+    let previewable = grant_previews(&app.asset_protocol_scope(), &state.engine.transfers(), &entries);
+    Ok(HistoryPage { entries, previewable })
+}
+
+/// Lets the webview load the received files among `entries` through the
+/// asset protocol, one validated file at a time (never a folder). A file
+/// whose transfer is still listed must lie inside that transfer's save
+/// folder. Returns the granted paths as the entries spell them.
+pub fn grant_previews(scope: &tauri::scope::fs::Scope, transfers: &[TransferSummary], entries: &[HistoryEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let path = preview::received_file(entry)?;
+            let root = transfers.iter().find(|t| t.id == entry.transfer_id).and_then(|t| t.save_dir.as_deref()).map(Path::new);
+            let canonical = preview::previewable_file(Path::new(path), root)?;
+            scope.allow_file(&canonical).ok()?;
+            Some(path.to_string())
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -251,7 +266,6 @@ fn clear_history(state: State<'_, AppState>) -> CmdResult<()> {
 #[tauri::command]
 async fn update_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> CmdResult<Settings> {
     let updated = state.engine.update_settings(settings).await.map_err(info)?;
-    let _ = app.asset_protocol_scope().allow_directory(updated.save_dir(), true);
     rebuild_tray(&app);
     Ok(updated)
 }
@@ -376,9 +390,13 @@ fn on_engine_event(app: &AppHandle, event: &EngineEvent) {
             let what = if t.file_count == 1 { t.title.clone() } else { format!("{} files", t.file_count) };
             notify(app, "Received", &format!("{what} from {}", t.peer.alias));
         }
-        EngineEvent::ServerStatus { running, port, error } => {
+        // Granted before the entry reaches the UI, which then shows its preview.
+        EngineEvent::HistoryAdded { entry } => {
             if let Some(state) = app.try_state::<AppState>() {
-                *state.server.lock().unwrap() = ServerState { running: *running, port: *port, error: error.clone() };
+                let granted = grant_previews(&app.asset_protocol_scope(), &state.engine.transfers(), std::slice::from_ref(entry));
+                if !granted.is_empty() {
+                    let _ = app.emit(PREVIEWABLE, &granted);
+                }
             }
         }
         EngineEvent::DeviceUpdated { device } if device.favorite || device.mine => rebuild_tray(app),
@@ -475,6 +493,11 @@ pub fn run() {
             // A second launch (e.g. "Send with Ferry" in Explorer) hands over its files.
             let paths = arg_paths(&args);
             if !paths.is_empty() {
+                // Queued, then announced: the UI takes the queue, so paths that
+                // arrive before its listener is up wait there instead of being lost.
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.pending_paths.lock().unwrap().extend(paths.iter().cloned());
+                }
                 let _ = app.emit("ferry://paths", &paths);
             }
             show_main(app);
@@ -491,15 +514,10 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             let engine = tauri::async_runtime::block_on(Engine::start(EngineConfig::persistent(data_dir)))
                 .map_err(|e| anyhow::anyhow!(e.info().message))?;
-            let _ = app.asset_protocol_scope().allow_directory(engine.settings().save_dir(), true);
 
             let args: Vec<String> = std::env::args().collect();
             let background = args.iter().any(|a| a == "--background");
-            app.manage(AppState {
-                engine: engine.clone(),
-                server: Mutex::new(ServerState { running: true, port: engine.port(), error: None }),
-                pending_paths: Mutex::new(arg_paths(&args)),
-            });
+            app.manage(AppState { engine: engine.clone(), pending_paths: Mutex::new(arg_paths(&args)) });
 
             let handle = app.handle().clone();
             let mut rx = engine.subscribe();
@@ -511,7 +529,7 @@ pub fn run() {
                             let _ = handle.emit(EVENT, &event);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let _ = handle.emit("ferry://resync", ());
+                            let _ = handle.emit(RESYNC, ());
                         }
                         Err(_) => break,
                     }

@@ -4,6 +4,8 @@ description = "Ferry's device-to-device transfer engine (LocalSend v2 compatible
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 publish = false
 
 [dependencies]

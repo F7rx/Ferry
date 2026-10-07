@@ -27,16 +27,17 @@ use crate::model::{
     RoomInfo, SignalingStatus, TransferFile, TransferState,
 };
 use crate::proto::{DeviceDto, FerryHint};
+use crate::receive::{MAX_SESSIONS, MAX_SESSIONS_PER_PEER, SessionSlot, SlotTable};
 use crate::send::{OutFile, SendItem, build_manifest};
 use crate::settings::AutoAccept;
 use crate::shared::{Shared, platform_name};
 use crate::transfer::{NewTransfer, TransferEntry};
-use crate::util::{now_ms, random_token};
+use crate::util::{message_history, now_ms, random_token};
 use async_trait::async_trait;
 use bytes::Bytes;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -49,6 +50,17 @@ use tokio_util::sync::CancellationToken;
 pub const DEVICE_PREFIX: &str = "rtc:";
 const MAX_PENDING: usize = 16;
 const MAX_PENDING_PER_PEER: usize = 3;
+/// Messages remembered by (peer, transfer id), so a re-sent or resumed
+/// transfer doesn't show its text twice.
+const MAX_DELIVERED: usize = 256;
+/// Receives with files per peer (identity key) and overall, from admission
+/// (while the user decides) until they end: the same caps as LAN sessions.
+const MAX_RECEIVES_PER_PEER: usize = MAX_SESSIONS_PER_PEER;
+const MAX_RECEIVES: usize = MAX_SESSIONS;
+/// Messages admitted per peer / overall within MESSAGE_WINDOW; more are declined.
+const MAX_MESSAGES_PER_PEER: usize = 10;
+const MAX_MESSAGES: usize = 30;
+const MESSAGE_WINDOW: Duration = Duration::from_secs(60);
 /// Sender reconnect attempts after an interruption.
 const RETRY_DELAYS: [u64; 6] = [1, 2, 4, 8, 15, 30];
 /// How long a receiver waits for an interrupted sender to come back.
@@ -103,7 +115,7 @@ fn kind_name(kind: DeviceKind) -> &'static str {
     }
 }
 
-fn webrtc_connection(relayed: bool, address: Option<String>) -> ConnectionInfo {
+fn webrtc_connection(relayed: Option<bool>, address: Option<String>) -> ConnectionInfo {
     let ip_version = address
         .as_deref()
         .and_then(|a| a.rsplit_once(':'))
@@ -152,6 +164,9 @@ struct Receive {
     /// Bumped when an interrupted transfer resumes (stale waiters stop).
     generation: std::sync::atomic::AtomicU64,
     interrupted_at: Mutex<Option<Instant>>,
+    /// Counts against the receive caps while the transfer is live or waiting
+    /// for its sender to come back; see [`SessionSlot`].
+    slot: Mutex<Option<SessionSlot<String>>>,
 }
 
 struct Outgoing {
@@ -182,6 +197,55 @@ struct State {
     receives: HashMap<(String, String), Arc<Receive>>,
     pending: HashMap<String, PendingRequest>,
     signaling_state: Option<SignalingState>,
+    /// Messages already shown, by (peer key, transferId), oldest first.
+    delivered: IndexSet<(String, String)>,
+    /// When recent messages were admitted, by peer key.
+    message_times: HashMap<String, VecDeque<Instant>>,
+}
+
+impl State {
+    /// Registers an offer waiting for its user unless the peer (or everyone
+    /// together) is at the cap. The earlier check in `on_offer` only saves
+    /// work; this one, made under the same lock as the insert, is what holds
+    /// when offers from several peers arrive at once.
+    fn add_pending(&mut self, id: &str, request: PendingRequest) -> bool {
+        let mine = self.pending.values().filter(|p| p.key == request.key).count();
+        if self.pending.len() >= MAX_PENDING || mine >= MAX_PENDING_PER_PEER {
+            return false;
+        }
+        self.pending.insert(id.to_string(), request);
+        true
+    }
+
+    /// Admits a message from `key` at `now` unless it (or everyone together)
+    /// sent too many within the last minute.
+    fn admit_message(&mut self, key: &str, now: Instant) -> bool {
+        let mut total = 0;
+        self.message_times.retain(|_, times| {
+            while times.front().is_some_and(|t| now.saturating_duration_since(*t) >= MESSAGE_WINDOW) {
+                times.pop_front();
+            }
+            total += times.len();
+            !times.is_empty()
+        });
+        let mine = self.message_times.get(key).map_or(0, VecDeque::len);
+        if mine >= MAX_MESSAGES_PER_PEER || total >= MAX_MESSAGES {
+            return false;
+        }
+        self.message_times.entry(key.to_string()).or_default().push_back(now);
+        true
+    }
+
+    /// Notes that the message of (`key`, `transfer_id`) is shown; false if it was already.
+    fn first_delivery(&mut self, key: &str, transfer_id: &str) -> bool {
+        if !self.delivered.insert((key.to_string(), transfer_id.to_string())) {
+            return false;
+        }
+        if self.delivered.len() > MAX_DELIVERED {
+            self.delivered.shift_remove_index(0);
+        }
+        true
+    }
 }
 
 pub struct RtcManager {
@@ -196,6 +260,8 @@ pub struct RtcManager {
     connect_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     nearby: std::sync::atomic::AtomicBool,
     loopback: std::sync::atomic::AtomicBool,
+    /// Receive slots in use, by peer key.
+    slots: Arc<Mutex<SlotTable<String>>>,
 }
 
 impl RtcManager {
@@ -211,6 +277,7 @@ impl RtcManager {
             connect_locks: tokio::sync::Mutex::new(HashMap::new()),
             nearby: std::sync::atomic::AtomicBool::new(true),
             loopback: std::sync::atomic::AtomicBool::new(false),
+            slots: Arc::new(Mutex::new(SlotTable::default())),
         }))
     }
 
@@ -423,10 +490,9 @@ impl RtcManager {
                     }
                     self.emit_room(&room);
                 }
-                SignalingEvent::RoomPeerJoined { room, peer } => {
-                    if self.state.lock().unwrap().rooms.contains_key(&room) {
-                        self.seen(peer, Some(room));
-                    }
+                // The guard's lock is released before `seen` takes it again.
+                SignalingEvent::RoomPeerJoined { room, peer } if self.state.lock().unwrap().rooms.contains_key(&room) => {
+                    self.seen(peer, Some(room));
                 }
                 SignalingEvent::RoomPeerLeft { room, peer_id } => self.gone(&peer_id, Some(&room)),
                 SignalingEvent::Error { code, message, room, .. } => {
@@ -711,7 +777,7 @@ impl RtcManager {
         if !fresh {
             let st = self.state.lock().unwrap();
             if let Some(s) = st.sessions.get(key).filter(|s| s.state() == SessionState::Ready) {
-                let info = st.connections.get(s.session_id()).cloned().unwrap_or_else(|| webrtc_connection(false, None));
+                let info = st.connections.get(s.session_id()).cloned().unwrap_or_else(|| webrtc_connection(None, None));
                 return Ok((s.clone(), info));
             }
         }
@@ -738,7 +804,7 @@ impl RtcManager {
         key: String,
         session: PeerSession,
         mut events: mpsc::UnboundedReceiver<SessionEvent>,
-        relayed: bool,
+        relayed: Option<bool>,
         address: Option<String>,
     ) {
         let connection = webrtc_connection(relayed, address);
@@ -834,8 +900,13 @@ impl RtcManager {
         self.state.lock().unwrap().receives.get(&(key.to_string(), transfer_id.to_string())).cloned()
     }
 
+    /// Removes an incoming transfer and frees its receive slot.
     fn take_receive(&self, key: &str, transfer_id: &str) -> Option<Arc<Receive>> {
-        self.state.lock().unwrap().receives.remove(&(key.to_string(), transfer_id.to_string()))
+        let r = self.state.lock().unwrap().receives.remove(&(key.to_string(), transfer_id.to_string()));
+        if let Some(r) = &r {
+            r.slot.lock().unwrap().take();
+        }
+        r
     }
 
     // ── Receiving ────────────────────────────────────────────────────────
@@ -851,19 +922,39 @@ impl RtcManager {
         let trust = self.shared.devices.trust(&id);
 
         // A message: shown right away, nothing to accept (LocalSend semantics).
-        if let Some(text) = offer.text.clone() {
-            self.message(&peer, text, trust.trusted);
-        }
         if offer.files.is_empty() {
-            let _ = offer.accept(Some(vec![]), &[]).await;
+            let Some(text) = offer.text.clone() else {
+                let _ = offer.accept(Some(vec![]), &[]).await;
+                return;
+            };
+            let admitted = {
+                let mut st = self.state.lock().unwrap();
+                let repeat = st.delivered.contains(&(key.clone(), offer.transfer_id.clone()));
+                repeat || st.admit_message(&key, Instant::now())
+            };
+            if !admitted {
+                let _ = offer.decline().await;
+                return;
+            }
+            if offer.accept(Some(vec![]), &[]).await.is_ok() {
+                self.deliver_message(&key, &peer, &offer.transfer_id, text, trust.trusted);
+            }
             return;
         }
 
         // An interrupted transfer comes back: continue without asking again.
+        // Its text (if any) was shown when it was first accepted.
         if let Some(r) = self.receive(&key, &offer.transfer_id) {
             self.resume_receive(r, offer).await;
             return;
         }
+
+        // Admitted from here on: the slot is held while the user decides and
+        // then by the transfer until it ends; every early return frees it.
+        let Some(slot) = SessionSlot::reserve(&self.slots, key.clone(), MAX_RECEIVES, MAX_RECEIVES_PER_PEER) else {
+            let _ = offer.decline().await;
+            return;
+        };
 
         let (pending_all, pending_peer) = {
             let st = self.state.lock().unwrap();
@@ -899,10 +990,11 @@ impl RtcManager {
         } else {
             let request_id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = oneshot::channel();
-            self.state.lock().unwrap().pending.insert(
-                request_id.clone(),
-                PendingRequest { key: key.clone(), transfer_id: offer.transfer_id.clone(), decision: Some(tx) },
-            );
+            let request = PendingRequest { key: key.clone(), transfer_id: offer.transfer_id.clone(), decision: Some(tx) };
+            if !self.state.lock().unwrap().add_pending(&request_id, request) {
+                let _ = offer.decline().await;
+                return;
+            }
             let timeout = Duration::from_secs(settings.decision_timeout_secs.clamp(10, 3600));
             self.shared.events.emit(EngineEvent::IncomingRequest {
                 request: IncomingRequest {
@@ -919,6 +1011,7 @@ impl RtcManager {
                         })
                         .collect(),
                     total_bytes: total,
+                    // Text that comes with files is shown once they are accepted.
                     text: None,
                     received_at_ms: now_ms(),
                     trusted: trust.trusted,
@@ -956,6 +1049,7 @@ impl RtcManager {
             let _ = self.shared.devices.update_flags(&id, Some(true), None, None, None);
         }
         if ids.is_empty() {
+            // Nothing accepted: like a decline, the text isn't shown.
             let _ = offer.accept(Some(vec![]), &[]).await;
             return;
         }
@@ -973,14 +1067,28 @@ impl RtcManager {
                 return;
             }
         };
+        *receive.slot.lock().unwrap() = Some(slot);
         *receive.session.lock().unwrap() = Some(offer.session().clone());
-        if let Err(e) = offer.accept(Some(ids), &[]).await {
-            self.take_receive(&key, &offer.transfer_id);
-            receive.entry.fail(TransferState::Failed, Some(err_info(&e)));
+        match offer.accept(Some(ids), &[]).await {
+            // Accepted, even in part: the message that came with the files arrives too.
+            Ok(()) => {
+                if let Some(text) = offer.text.clone() {
+                    self.deliver_message(&key, &peer, &offer.transfer_id, text, trust.trusted);
+                }
+            }
+            Err(e) => {
+                self.take_receive(&key, &offer.transfer_id);
+                receive.entry.fail(TransferState::Failed, Some(err_info(&e)));
+            }
         }
     }
 
-    fn message(&self, peer: &PeerRef, text: String, trusted: bool) {
+    /// Shows a message once per (peer, transfer) and records it as the
+    /// history settings allow.
+    fn deliver_message(&self, key: &str, peer: &PeerRef, transfer_id: &str, text: String, trusted: bool) {
+        if !self.state.lock().unwrap().first_delivery(key, transfer_id) {
+            return;
+        }
         let settings = self.shared.settings.get();
         let id = uuid::Uuid::new_v4().to_string();
         self.shared.events.emit(EngineEvent::IncomingRequest {
@@ -997,7 +1105,7 @@ impl RtcManager {
             },
         });
         if settings.history_enabled {
-            let line: String = text.lines().next().unwrap_or("").chars().take(80).collect();
+            let (name, kept) = message_history(&text, settings.keep_message_text);
             let entry = NewHistoryEntry {
                 transfer_id: id,
                 direction: Direction::Receive,
@@ -1005,11 +1113,11 @@ impl RtcManager {
                 peer_alias: peer.alias.clone(),
                 peer_kind: peer.device_kind,
                 kind: HistoryKind::Text,
-                name: if line.is_empty() { "Message".into() } else { line },
+                name,
                 size: text.len() as u64,
                 mime: "text/plain".into(),
                 path: None,
-                text: settings.keep_message_text.then_some(text),
+                text: kept,
                 timestamp_ms: now_ms(),
                 status: HistoryStatus::Completed,
                 verified: true,
@@ -1108,6 +1216,7 @@ impl RtcManager {
                 .collect(),
             state: TransferState::Transferring,
             resumable: true,
+            pausable: false,
             text: None,
             save_dir: save_root.map(|p| p.display().to_string()),
             connection: Some(connection),
@@ -1122,6 +1231,7 @@ impl RtcManager {
             session: Mutex::new(None),
             generation: Default::default(),
             interrupted_at: Mutex::new(None),
+            slot: Mutex::new(None),
         });
         self.state.lock().unwrap().receives.insert((key.to_string(), transfer_id.to_string()), receive.clone());
         Ok(receive)
@@ -1142,6 +1252,8 @@ impl RtcManager {
         tokio::spawn(async move {
             tokio::time::sleep(RECEIVER_WAIT).await;
             if r.generation.load(Ordering::SeqCst) == generation && r.entry.state() == TransferState::Reconnecting {
+                // Kept for a later resume, but no longer counted as live.
+                r.slot.lock().unwrap().take();
                 r.entry.fail(
                     TransferState::Failed,
                     Some(
@@ -1175,9 +1287,16 @@ impl RtcManager {
                         final_path: f.final_path.as_ref().map(|p| p.display().to_string()),
                         offset: std::fs::metadata(part).map(|m| m.len()).unwrap_or(0),
                         done: f.final_path.is_some(),
+                        sha256: None,
+                        attempts: 0,
                     })
                 })
                 .collect(),
+            // Only kept for cleanup: WebRTC transfers resume from memory.
+            save_root: Some(r.save_dir.display().to_string()),
+            display_root: None,
+            manifest: false,
+            declined: Vec::new(),
         };
         if !record.files.is_empty() {
             let _ = self.shared.db.save_inbound(&record);
@@ -1214,6 +1333,14 @@ impl RtcManager {
         tracing::info!("Resuming WebRTC transfer {} from {} at {offsets:?}", r.transfer_id, r.peer.alias);
         r.generation.fetch_add(1, Ordering::SeqCst);
         *r.interrupted_at.lock().unwrap() = None;
+        {
+            // Live again: counted again where there is room. It was admitted
+            // already, so full caps don't stop the sender's resend.
+            let mut slot = r.slot.lock().unwrap();
+            if slot.is_none() {
+                *slot = SessionSlot::reserve(&self.slots, r.key.clone(), MAX_RECEIVES, MAX_RECEIVES_PER_PEER);
+            }
+        }
         *r.session.lock().unwrap() = Some(offer.session().clone());
         for (id, off) in &offsets {
             r.entry.reset_file_progress(id, *off);
@@ -1250,6 +1377,7 @@ impl RtcManager {
             keys.iter().filter_map(|k| st.receives.remove(k)).collect()
         };
         for r in stale {
+            r.slot.lock().unwrap().take();
             self.discard_parts(&r);
         }
     }
@@ -1337,9 +1465,10 @@ impl RtcManager {
                 .collect(),
             state: TransferState::Preparing,
             resumable: true,
+            pausable: false,
             text: text.clone(),
             save_dir: None,
-            connection: Some(webrtc_connection(false, None)),
+            connection: Some(webrtc_connection(None, None)),
         });
         let out = Arc::new(Outgoing { entry, cancel: self.shared.shutdown.child_token(), session: Mutex::new(None) });
         self.state.lock().unwrap().outgoing.insert(id.clone(), out.clone());
@@ -1498,7 +1627,8 @@ impl RtcManager {
 
     fn finish_history(&self, out: &Outgoing) {
         self.state.lock().unwrap().outgoing.remove(&out.entry.id);
-        if !self.shared.settings.get().history_enabled {
+        let settings = self.shared.settings.get();
+        if !settings.history_enabled {
             return;
         }
         let peer = out.entry.peer();
@@ -1513,6 +1643,10 @@ impl RtcManager {
                 _ => HistoryStatus::Failed,
             };
             let is_text = file.id == "text" && text.is_some();
+            let (name, kept) = match &text {
+                Some(t) if is_text => message_history(t, settings.keep_message_text),
+                _ => (file.name.clone(), None),
+            };
             let entry = NewHistoryEntry {
                 transfer_id: out.entry.id.clone(),
                 direction: Direction::Send,
@@ -1520,11 +1654,11 @@ impl RtcManager {
                 peer_alias: peer.alias.clone(),
                 peer_kind: peer.device_kind,
                 kind: if is_text { HistoryKind::Text } else { HistoryKind::File },
-                name: if is_text { text.as_deref().map(|t| t.chars().take(80).collect()).unwrap_or_default() } else { file.name.clone() },
+                name,
                 size: file.size,
                 mime: file.mime.clone(),
                 path: file.path.clone(),
-                text: None,
+                text: kept,
                 timestamp_ms: now_ms(),
                 status,
                 verified: status == HistoryStatus::Completed,
@@ -1866,5 +2000,53 @@ impl FileSource for PathSource {
         })
         .await
         .map_err(std::io::Error::other)?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(key: &str) -> PendingRequest {
+        PendingRequest { key: key.into(), transfer_id: "t".into(), decision: None }
+    }
+
+    #[test]
+    fn pending_offers_are_capped_per_peer_and_in_total() {
+        let mut st = State::default();
+        for i in 0..MAX_PENDING_PER_PEER {
+            assert!(st.add_pending(&format!("a{i}"), request("A")));
+        }
+        assert!(!st.add_pending("a-extra", request("A")), "per-peer cap");
+        for n in MAX_PENDING_PER_PEER..MAX_PENDING {
+            assert!(st.add_pending(&format!("p{n}"), request(&format!("P{}", n / MAX_PENDING_PER_PEER))));
+        }
+        assert!(!st.add_pending("fresh", request("NEW")), "global cap");
+        st.pending.remove("a0");
+        assert!(st.add_pending("fresh", request("NEW")), "a freed place is reused");
+        assert_eq!(st.pending.len(), MAX_PENDING);
+    }
+
+    #[test]
+    fn messages_are_rate_limited_per_peer_and_in_total() {
+        let mut st = State::default();
+        let start = Instant::now();
+        for _ in 0..MAX_MESSAGES_PER_PEER {
+            assert!(st.admit_message("A", start));
+        }
+        assert!(!st.admit_message("A", start), "per-peer limit");
+        let mut n = MAX_MESSAGES_PER_PEER;
+        let mut peer = 0;
+        while n < MAX_MESSAGES {
+            assert!(st.admit_message(&format!("P{}", peer / MAX_MESSAGES_PER_PEER), start), "{n}");
+            peer += 1;
+            n += 1;
+        }
+        assert!(!st.admit_message("NEW", start), "global limit");
+        // A minute later the window has moved on.
+        let later = start + MESSAGE_WINDOW;
+        assert!(st.admit_message("A", later));
+        assert!(st.admit_message("NEW", later));
+        assert_eq!(st.message_times.values().map(VecDeque::len).sum::<usize>(), 2, "old times are forgotten");
     }
 }

@@ -9,7 +9,7 @@ import TransferCard from "../components/TransferCard.vue";
 import DeviceAvatar from "../components/DeviceAvatar.vue";
 import FIcon from "../components/FIcon.vue";
 import FToggle from "../components/FToggle.vue";
-import { activeTransfers, displayName, onlineDevices, quickDevices, saveSettings, store, transfers } from "../stores/engine";
+import { activeTransfers, displayName, onlineDevices, quickDevices, received, saveSettings, store, transfers } from "../stores/engine";
 import { sendNow } from "../stores/compose";
 import { platform } from "../platform";
 import { formatBytes, plural, relativeTime } from "../lib/format";
@@ -21,7 +21,7 @@ const router = useRouter();
 const receiving = computed(() => store.settings?.receiveEnabled !== false);
 const recent = computed(() => transfers.value.filter((t) => !activeTransfers.value.includes(t)).slice(0, 3));
 const shownTransfers = computed(() => [...activeTransfers.value, ...recent.value].slice(0, 4));
-const lastReceived = computed(() => store.history.filter((h) => h.direction === "receive").slice(0, 3));
+const lastReceived = computed(() => received.value.slice(0, 3));
 const autoAcceptLabel = computed(() => ({ off: "Always ask", myDevices: "My devices", trusted: "Trusted devices" })[store.settings?.autoAccept ?? "myDevices"]);
 const clipboardTargets = computed(() => quickDevices.value.filter((d) => d.online).slice(0, 4));
 

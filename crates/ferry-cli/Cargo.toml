@@ -4,6 +4,8 @@ description = "Ferry from the terminal: send, receive, list devices (LocalSend c
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 publish = false
 
 [[bin]]

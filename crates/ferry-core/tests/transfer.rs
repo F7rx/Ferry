@@ -27,9 +27,12 @@ async fn sends_files_and_folders() {
     assert_eq!(sent.file_count, 3);
     assert_eq!(sent.bytes_done, sent.total_bytes);
     assert!(sent.resumable, "Ferry peers negotiate resumable transfers");
+    assert!(sent.can_pause && sent.can_resume, "LAN sends can be paused by the user");
 
     let received = rx.wait_received(T).await;
     assert_eq!(received.state, TransferState::Completed);
+    assert!(received.resumable);
+    assert!(!received.can_pause && !received.can_resume, "LAN receives can't be paused");
     assert_eq!(files_in(rx.save_dir.path()), vec!["Album/nested/two.bin", "Album/one.jpg", "hello.txt"]);
     assert_eq!(std::fs::read(rx.saved("Album/nested/two.bin")).unwrap(), pattern(1_500_000, 2));
     assert_eq!(std::fs::read(rx.saved("hello.txt")).unwrap(), b"hello world");
@@ -99,6 +102,10 @@ async fn partial_acceptance_skips_the_rest() {
     assert_eq!(request.files.len(), 2);
     assert_eq!(request.peer.alias, "Sender");
     assert!(request.peer.verified);
+    // A shell that missed the event gets the prompt back from a snapshot.
+    let snap = rx.engine.snapshot();
+    assert_eq!(snap.pending_requests.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), [request.id.as_str()]);
+    assert!(snap.server.running && snap.server.port == rx.engine.port());
     let keep = request.files.iter().find(|f| f.name == "keep.txt").unwrap().id.clone();
     rx.engine.respond(&request.id, Decision { accept: Some(vec![keep]), ..Default::default() });
 
@@ -106,6 +113,7 @@ async fn partial_acceptance_skips_the_rest() {
     assert_eq!(sent.state, TransferState::Completed);
     assert_eq!(sent.file_count, 2);
     assert_eq!(files_in(rx.save_dir.path()), vec!["keep.txt"]);
+    assert!(rx.engine.snapshot().pending_requests.is_empty(), "an answered request is no longer pending");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -116,9 +124,54 @@ async fn text_messages_are_delivered_without_files() {
     let event = rx.wait_event(T, |e| matches!(e, EngineEvent::IncomingRequest { request } if request.text.is_some())).await;
     let EngineEvent::IncomingRequest { request } = event else { unreachable!() };
     assert_eq!(request.text.as_deref(), Some("https://example.com/hello"));
+    assert!(rx.engine.pending_requests().is_empty(), "a message needs no decision");
     let sent = tx.wait_final(&ids[0], T).await;
     assert_eq!(sent.state, TransferState::Completed);
     assert!(files_in(rx.save_dir.path()).is_empty());
+}
+
+/// Text entries in `peer`'s history once they are written (or none after a while).
+async fn text_history(peer: &Peer, direction: Direction, expect: bool) -> Vec<HistoryEntry> {
+    let read = || -> Vec<HistoryEntry> {
+        peer.engine.history(50, None, Some(direction)).unwrap().into_iter().filter(|h| h.kind == HistoryKind::Text).collect()
+    };
+    for _ in 0..if expect { 100 } else { 10 } {
+        if expect && !read().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    read()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn message_history_follows_the_privacy_settings() {
+    let text = "the door code is 4711\nsecond line";
+    for (history, keep) in [(false, false), (false, true), (true, false), (true, true)] {
+        let tweak = move |s: &mut ferry_core::Settings| {
+            s.history_enabled = history;
+            s.keep_message_text = keep;
+        };
+        let mut rx = peer_with("Receiver", tweak).await;
+        let mut tx = peer_with("Sender", tweak).await;
+        let ids = tx.engine.send(vec![rx.target()], vec![SendItem::Text { text: text.into() }]).await.unwrap();
+        rx.wait_event(T, |e| matches!(e, EngineEvent::IncomingRequest { request } if request.text.is_some())).await;
+        assert_eq!(tx.wait_final(&ids[0], T).await.state, TransferState::Completed);
+        for (who, direction) in [(&rx, Direction::Receive), (&tx, Direction::Send)] {
+            let entries = text_history(who, direction, history).await;
+            if !history {
+                assert!(entries.is_empty(), "history off records nothing: {entries:?}");
+                continue;
+            }
+            assert_eq!(entries.len(), 1, "{direction:?}: {entries:?}");
+            let e = &entries[0];
+            if keep {
+                assert_eq!((e.name.as_str(), e.text.as_deref()), ("the door code is 4711", Some(text)), "{direction:?}");
+            } else {
+                assert_eq!((e.name.as_str(), e.text.as_deref()), ("Message", None), "{direction:?}: nothing of the text is kept");
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

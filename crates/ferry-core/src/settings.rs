@@ -46,7 +46,7 @@ pub struct Settings {
 
     // ── History & privacy ─────────────────────────────────────────────
     pub history_enabled: bool,
-    /// Store the body of received text messages in history.
+    /// Store the body of text messages in history (else they are listed as "Message").
     pub keep_message_text: bool,
 
     // ── Transfers ─────────────────────────────────────────────────────
