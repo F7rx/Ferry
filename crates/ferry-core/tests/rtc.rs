@@ -57,7 +57,11 @@ async fn find(peer: &Peer, alias: &str) -> String {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("{alias} never appeared"))
+    .unwrap_or_else(|_| {
+        let seen: Vec<String> = peer.engine.devices().iter().map(|d| format!("{} {} online={}", d.alias, d.id, d.online)).collect();
+        let status = peer.engine.signaling_status();
+        panic!("{alias} never appeared; signaling {} {:?}; devices {seen:?}", status.state, status.error)
+    })
 }
 
 async fn absent(peer: &Peer, alias: &str, wait: Duration) -> bool {
@@ -456,6 +460,39 @@ async fn text_history(peer: &Peer, direction: Direction, expect: bool) -> Vec<Hi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_stays_present_while_a_second_connection_of_it_comes_and_goes() {
+    let url = signal_server().await;
+    let mut a = rtc_peer("Alice", &url, |_| {}).await;
+    let b = rtc_peer("Bob", &url, |_| {}).await;
+    let bob = find(&a, "Bob").await;
+    // A second connection under Bob's key, as when a device reconnects before
+    // the server has dropped its old connection...
+    let key = b.engine.signaling_status().identity_key;
+    let info = ClientInfoOut {
+        alias: "Bob".into(),
+        device_model: None,
+        device_type: Some("desktop".into()),
+        token: "second".into(),
+        public_key: key,
+        nearby: None,
+    };
+    let (extra, mut events) = SignalingClient::start(SignalingConfig::new(&url, info));
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(20), events.recv()).await.expect("connects").expect("events");
+        if matches!(ev, SignalingEvent::Hello { .. }) {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // ...leaves again: Bob is still present and reachable on his first one.
+    extra.close();
+    assert!(!absent(&a, "Bob", Duration::from_millis(1500)).await, "Bob must stay present");
+    let id = send(&a, &bob, vec![SendItem::Text { text: "still here".into() }]).await.remove(0);
+    let sent = a.wait_final(&id, LONG).await;
+    assert_eq!(sent.state, TransferState::Completed, "{sent:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn message_history_follows_the_privacy_settings() {
     let url = signal_server().await;
     let text = "the door code is 4711\nsecond line";
@@ -469,8 +506,10 @@ async fn message_history_follows_the_privacy_settings() {
         let mut b = rtc_peer(&receiver, &url, tweak).await;
         let bob = find(&a, &receiver).await;
         let id = send(&a, &bob, vec![SendItem::Text { text: text.into() }]).await.remove(0);
+        // The sender's outcome first: when it fails, its error says why.
+        let sent = a.wait_final(&id, LONG).await;
+        assert_eq!(sent.state, TransferState::Completed, "{sent:?}");
         b.wait_event(LONG, |e| matches!(e, EngineEvent::IncomingRequest { request } if request.text.is_some())).await;
-        assert_eq!(a.wait_final(&id, LONG).await.state, TransferState::Completed);
         for (who, direction) in [(&b, Direction::Receive), (&a, Direction::Send)] {
             let entries = text_history(who, direction, history).await;
             if !history {

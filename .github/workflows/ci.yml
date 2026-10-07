@@ -39,6 +39,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked -p ferry-core -p ferry-cli -p ferry-signal --all-targets -- -D warnings
       - name: Test
+        # Test logs are captured per test and printed only for failures, so
+        # WebRTC and signaling debug output costs nothing when tests pass.
+        env:
+          FERRY_LOG: ferry_core::rtc=debug,ferry_signal=debug
         run: cargo test --locked --no-fail-fast -p ferry-core -p ferry-cli -p ferry-signal -p ferry-localsend --features ferry-localsend/full
 
   web:

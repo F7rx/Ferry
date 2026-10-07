@@ -19,7 +19,13 @@ export const repoRoot = join(appDir, "..", "..");
 export const exe = process.platform === "win32" ? ".exe" : "";
 
 export function launchBrowser() {
-  return chromium.launch({ channel: process.env.FERRY_E2E_CHANNEL || "chrome" });
+  return chromium.launch({
+    channel: process.env.FERRY_E2E_CHANNEL || "chrome",
+    // Chrome hides local addresses behind random .local names, which two
+    // browsers on a CI runner can't resolve (no mDNS responder there); real
+    // addresses let them connect over loopback as they do on a desktop.
+    args: ["--disable-features=WebRtcHideLocalIpsWithMdns"],
+  });
 }
 
 const children = new Set();

@@ -251,6 +251,20 @@ impl Connector {
                 self.fail(&peer.id, session_id, RtcError::new("cancelled", "the peer cancelled"), false);
                 None
             }
+            // The server couldn't route our offer: that connection of the peer
+            // is gone (it left, or reconnected under a new id). Fail the attempt
+            // now so the caller can look the peer up again, instead of waiting
+            // for the connect timeout.
+            SignalingEvent::Error { code, session_id: Some(session_id), .. } if code.as_u64() == Some(404) => {
+                let peers: Vec<String> = {
+                    let entries = self.entries.lock().unwrap();
+                    entries.iter().filter(|((_, s), e)| s == session_id && e.session.is_none()).map(|((p, _), _)| p.clone()).collect()
+                };
+                for peer in peers {
+                    self.fail(&peer, session_id, RtcError::new("gone", "the device is no longer at that address"), false);
+                }
+                None
+            }
             _ => None,
         }
     }

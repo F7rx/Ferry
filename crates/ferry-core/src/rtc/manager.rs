@@ -70,7 +70,7 @@ const RESUME_TTL: Duration = Duration::from_secs(24 * 3600);
 const SYNC_THRESHOLD: u64 = 8 * 1024 * 1024;
 /// Presence is re-confirmed this often (the directory marks silent devices offline).
 const PRESENCE_REFRESH: Duration = Duration::from_secs(30);
-/// Codes that end a send; anything else (closed, timeout, webrtc, offline) is retried.
+/// Codes that end a send; anything else (closed, timeout, webrtc, offline, gone) is retried.
 const FATAL: [&str; 12] = [
     "invalid",
     "invalid-state",
@@ -185,6 +185,10 @@ struct PendingRequest {
 struct State {
     /// Peers on the signaling server, by identity key.
     present: HashMap<String, ClientInfo>,
+    /// Every connection seen, by client id. A device that reconnects is
+    /// briefly there twice under one key; when one connection leaves, the
+    /// other keeps it present.
+    clients: HashMap<String, ClientInfo>,
     /// Present in our nearby group (else only through rooms).
     nearby: HashSet<String>,
     rooms: IndexMap<String, Room>,
@@ -440,10 +444,16 @@ impl RtcManager {
     ) {
         loop {
             let event = tokio::select! {
-                e = events.recv() => e,
+                biased;
                 _ = stop.cancelled() => return,
+                e = events.recv() => e,
             };
             let Some(event) = event else { return };
+            // A stopped connection's last events (its own Closed, a late Hello)
+            // must not touch the shared presence its replacement already filled.
+            if stop.is_cancelled() {
+                return;
+            }
             if let Some(incoming) = connector.handle_signal(&event) {
                 self.on_incoming_connection(&connector, incoming);
                 continue;
@@ -457,7 +467,11 @@ impl RtcManager {
                     self.emit_status();
                 }
                 SignalingEvent::Hello { peers, .. } => {
-                    let old: Vec<String> = self.state.lock().unwrap().nearby.drain().collect();
+                    let old: Vec<String> = {
+                        let mut st = self.state.lock().unwrap();
+                        st.clients.clear();
+                        st.nearby.drain().collect()
+                    };
                     for k in old {
                         self.drop_key(&k);
                     }
@@ -529,6 +543,7 @@ impl RtcManager {
                     st.nearby.insert(key.clone());
                 }
             }
+            st.clients.insert(peer.id.clone(), peer.clone());
             st.present.insert(key.clone(), peer);
         }
         self.announce(&key);
@@ -538,9 +553,24 @@ impl RtcManager {
     }
 
     fn gone(&self, client_id: &str, room: Option<&str>) {
-        let keys: Vec<String> = {
+        let (keys, moved) = {
             let mut st = self.state.lock().unwrap();
-            let keys: Vec<String> = st.present.iter().filter(|(_, p)| p.id == client_id).map(|(k, _)| k.clone()).collect();
+            st.clients.remove(client_id);
+            let mut keys = Vec::new();
+            let mut moved = Vec::new();
+            let left: Vec<String> = st.present.iter().filter(|(_, p)| p.id == client_id).map(|(k, _)| k.clone()).collect();
+            for k in left {
+                // Still connected another way (a reconnect overlapping the old
+                // connection): carry on with that one.
+                let other = st.clients.values().find(|c| c.key() == Some(k.as_str())).cloned();
+                match other {
+                    Some(c) => {
+                        st.present.insert(k.clone(), c);
+                        moved.push(k);
+                    }
+                    None => keys.push(k),
+                }
+            }
             for k in &keys {
                 match room {
                     Some(r) => {
@@ -553,10 +583,13 @@ impl RtcManager {
                     }
                 }
             }
-            keys
+            (keys, moved)
         };
         for k in keys {
             self.drop_key(&k);
+        }
+        for k in moved {
+            self.announce(&k);
         }
         if let Some(r) = room {
             self.emit_room(r);
@@ -584,6 +617,7 @@ impl RtcManager {
         let (keys, rooms) = {
             let mut st = self.state.lock().unwrap();
             st.nearby.clear();
+            st.clients.clear();
             for r in st.rooms.values_mut() {
                 r.peers.clear();
             }
