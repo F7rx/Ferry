@@ -159,10 +159,12 @@ async fn code_comparison_can_be_declined_or_withdrawn() {
     let second = desk.engine.start_code_pairing(&laptop_id).await.unwrap();
     let event = laptop.wait_event(T, |e| matches!(e, EngineEvent::PairingRequest { .. })).await;
     let EngineEvent::PairingRequest { request } = event else { unreachable!() };
+    assert_eq!(laptop.engine.snapshot().pairing_requests.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), [request.id.as_str()]);
     assert!(desk.engine.cancel_code_pairing(&second.id));
     let event = desk.wait_event(T, |e| matches!(e, EngineEvent::PairingFinished { .. })).await;
     assert!(matches!(event, EngineEvent::PairingFinished { outcome: PairingOutcome::Cancelled, .. }));
     laptop.wait_event(T, |e| matches!(e, EngineEvent::PairingRequestClosed { id } if *id == request.id)).await;
+    assert!(laptop.engine.pairing_requests().is_empty(), "a withdrawn prompt is not restored by a snapshot");
     assert!(!laptop.engine.respond_pairing(&request.id, true), "a withdrawn prompt can't be accepted");
     assert!(!desk.engine.devices().iter().any(|d| d.mine));
     assert!(!laptop.engine.devices().iter().any(|d| d.mine));

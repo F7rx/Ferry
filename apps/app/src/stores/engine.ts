@@ -16,6 +16,7 @@ import type {
   IncomingRequest,
   LocalDevice,
   Settings,
+  Snapshot,
   TransferFile,
   TransferSummary,
 } from "../platform";
@@ -30,14 +31,21 @@ export interface Toast {
 
 export const store = reactive({
   ready: false,
+  /** Loading (or reloading) the engine's state failed; Retry calls `initEngine`. */
+  syncError: null as string | null,
   local: null as LocalDevice | null,
   devices: new Map<string, DeviceSummary>(),
   transfers: new Map<string, TransferSummary>(),
   /** Per-file details, kept only for transfers the user expanded. */
   files: new Map<string, TransferFile[]>(),
   requests: [] as IncomingRequest[],
+  /** Incoming messages, newest first (at most MAX_MESSAGES). */
   messages: [] as IncomingRequest[],
   history: [] as HistoryEntry[],
+  /** Browser: newest Inbox entries (received files are listed even while history is off). */
+  inbox: [] as HistoryEntry[],
+  /** Bumped after history or received files were cleared, so lists reload. */
+  historyRevision: 0,
   settings: null as Settings | null,
   server: { running: true, port: 53317, error: null as string | null },
   links: new Map<string, BrowserLink>(),
@@ -55,6 +63,10 @@ export const store = reactive({
   },
   toasts: [] as Toast[],
 });
+
+/** Unread messages kept for the message card; older ones are dropped. */
+const MAX_MESSAGES = 20;
+const MAX_HISTORY = 400;
 
 let toastId = 1;
 export function toast(t: Omit<Toast, "id">, ms = 5200) {
@@ -98,10 +110,17 @@ function handle(event: EngineEvent) {
       store.devices.delete(event.id);
       break;
     case "incomingRequest":
-      if (event.request.text != null) store.messages.unshift(event.request);
-      else store.requests.push(event.request);
+      if (event.request.text != null) {
+        if (!store.messages.some((m) => m.id === event.request.id)) {
+          store.messages.unshift(event.request);
+          if (store.messages.length > MAX_MESSAGES) store.messages.length = MAX_MESSAGES;
+        }
+      } else if (!answered.has(event.request.id)) {
+        upsert(store.requests, event.request);
+      }
       break;
     case "incomingRequestClosed":
+      answered.delete(event.id);
       store.requests = store.requests.filter((r) => r.id !== event.id);
       break;
     case "transferUpdated": {
@@ -125,8 +144,14 @@ function handle(event: EngineEvent) {
       store.files.delete(event.id);
       break;
     case "historyAdded":
+      if (store.history.some((h) => h.id === event.entry.id)) break;
       store.history.unshift(event.entry);
-      if (store.history.length > 400) store.history.length = 400;
+      if (store.history.length > MAX_HISTORY) store.history.length = MAX_HISTORY;
+      break;
+    case "inboxAdded":
+      if (store.inbox.some((h) => h.id === event.entry.id)) break;
+      store.inbox.unshift(event.entry);
+      if (store.inbox.length > MAX_HISTORY) store.inbox.length = MAX_HISTORY;
       break;
     case "serverStatus":
       store.server = { running: event.running, port: event.port, error: event.error };
@@ -145,9 +170,10 @@ function handle(event: EngineEvent) {
       }
       break;
     case "pairingRequest":
-      store.pairing.requests.push(event.request);
+      if (!answered.has(event.request.id)) upsert(store.pairing.requests, event.request);
       break;
     case "pairingRequestClosed":
+      answered.delete(event.id);
       store.pairing.requests = store.pairing.requests.filter((r) => r.id !== event.id);
       break;
     case "pairingFinished": {
@@ -188,20 +214,162 @@ function onFinished(t: TransferSummary) {
   }
 }
 
-export async function initEngine() {
-  platform.subscribe(handle);
-  const snap = await platform.init();
+function upsert<T extends { id: string }>(list: T[], item: T) {
+  const i = list.findIndex((x) => x.id === item.id);
+  if (i >= 0) list[i] = item;
+  else list.push(item);
+}
+
+function replaceAll<T extends { id: string }>(map: Map<string, T>, items: T[]) {
+  map.clear();
+  for (const item of items) map.set(item.id, item);
+}
+
+// ── Startup and resync ────────────────────────────────────────────────────
+//
+// Listeners are installed (and awaited) before the snapshot is requested, so
+// no event falls between the two. Events that arrive while a snapshot loads
+// are queued and applied after it: the snapshot may be older than they are,
+// never newer than the last event about the same thing. Every handler is an
+// idempotent upsert or removal by id, so replaying an event the snapshot
+// already reflects changes nothing.
+
+let unsubscribe: (() => void) | null = null;
+/** Events received while a snapshot loads; null when none is loading. */
+let queue: EngineEvent[] | null = null;
+let syncing: Promise<boolean> | null = null;
+let syncAgain = false;
+let syncToast: number | null = null;
+/**
+ * Prompts answered here that the engine hasn't closed yet: a snapshot read in
+ * between must not bring them back.
+ */
+const answered = new Set<string>();
+
+export function markAnswered(id: string) {
+  answered.add(id);
+}
+
+function onEvent(event: EngineEvent) {
+  if (queue) queue.push(event);
+  else handle(event);
+}
+
+/**
+ * Subscribes (once) and loads the engine's state. Also the Retry action after
+ * a failure. Resolves to whether the state is loaded.
+ */
+export async function initEngine(): Promise<boolean> {
+  if (!unsubscribe) {
+    try {
+      unsubscribe = await platform.subscribe(onEvent, () => void resync());
+    } catch (err) {
+      syncFailed(err);
+      return false;
+    }
+  }
+  return resync();
+}
+
+/** Stops listening to the engine (tests, hot reload). */
+export function stopEngine() {
+  unsubscribe?.();
+  unsubscribe = null;
+}
+
+/**
+ * Replaces the mirrored state with a fresh snapshot (on startup, and when the
+ * shell reports missed events). Requests during a load run one more load.
+ */
+export function resync(): Promise<boolean> {
+  if (syncing) {
+    syncAgain = true;
+    return syncing;
+  }
+  syncing = (async () => {
+    let ok: boolean;
+    do {
+      syncAgain = false;
+      ok = await loadSnapshot();
+    } while (syncAgain);
+    return ok;
+  })().finally(() => (syncing = null));
+  return syncing;
+}
+
+async function loadSnapshot(): Promise<boolean> {
+  queue = [];
+  try {
+    const snap = await platform.init();
+    // Engines without these in their snapshot answer separately; a failed
+    // lookup keeps what is shown.
+    const [history, inbox, links, rooms, signaling] = await Promise.all([
+      platform.history(120).catch(() => null),
+      platform.inbox ? platform.inbox(120).catch(() => null) : null,
+      snap.browserLinks ?? platform.browserLinks().catch(() => null),
+      snap.rooms ?? platform.rooms().catch(() => null),
+      snap.signaling !== undefined ? snap.signaling : platform.signalingStatus().catch(() => undefined),
+    ]);
+    applySnapshot(snap);
+    if (history) store.history = history;
+    if (inbox) store.inbox = inbox;
+    if (links) replaceAll(store.links, links);
+    if (rooms) replaceAll(store.rooms, rooms);
+    if (signaling !== undefined) store.signaling = signaling;
+    store.syncError = null;
+    if (syncToast != null) dismissToast(syncToast);
+    syncToast = null;
+    store.ready = true;
+    return true;
+  } catch (err) {
+    syncFailed(err);
+    return false;
+  } finally {
+    const pending = queue ?? [];
+    queue = null;
+    for (const event of pending) handle(event);
+  }
+}
+
+function applySnapshot(snap: Snapshot) {
   store.local = snap.local;
-  for (const d of snap.devices) store.devices.set(d.id, d);
-  for (const t of snap.transfers) store.transfers.set(t.id, t);
   store.settings = snap.settings;
-  store.server = snap.server;
-  store.history = (await platform.history(120).catch(() => [])) ?? [];
-  for (const l of (await platform.browserLinks().catch(() => [])) ?? []) store.links.set(l.id, l);
-  for (const r of (await platform.rooms().catch(() => [])) ?? []) store.rooms.set(r.id, r);
-  store.signaling = (await platform.signalingStatus().catch(() => null)) ?? null;
-  store.ready = true;
-  return snap as typeof snap & { pendingPaths?: string[] };
+  store.server = { ...snap.server };
+  replaceAll(store.devices, snap.devices);
+  const before = new Map(store.transfers);
+  replaceAll(store.transfers, snap.transfers);
+  for (const id of [...store.files.keys()]) if (!store.transfers.has(id)) store.files.delete(id);
+  // Finished while the events were missed: same notice as live.
+  for (const t of snap.transfers) {
+    const prev = before.get(t.id);
+    if (prev && !isFinal(prev.state) && isFinal(t.state)) onFinished(t);
+  }
+  if (snap.pendingRequests) {
+    const open = new Set(snap.pendingRequests.map((r) => r.id));
+    store.requests = snap.pendingRequests.filter((r) => !answered.has(r.id));
+    if (snap.pairingRequests) {
+      for (const r of snap.pairingRequests) open.add(r.id);
+      store.pairing.requests = snap.pairingRequests.filter((r) => !answered.has(r.id));
+    }
+    // Answered prompts the engine has since closed.
+    for (const id of [...answered]) if (!open.has(id)) answered.delete(id);
+  }
+  if (store.pairing.offer && store.pairing.offer.expiresAtMs <= Date.now()) store.pairing.offer = null;
+}
+
+function syncFailed(err: unknown) {
+  const { title } = errorText(err);
+  store.syncError = title;
+  if (syncToast != null) dismissToast(syncToast);
+  syncToast = toast(
+    {
+      level: "error",
+      title: store.ready ? "Ferry may be showing out-of-date information" : "Ferry couldn't start",
+      body: title,
+      action: { label: "Retry", run: () => void initEngine() },
+    },
+    0,
+  );
 }
 
 // ── Derived views ─────────────────────────────────────────────────────────
@@ -221,6 +389,9 @@ export const quickDevices = computed(() => devices.value.filter((d) => d.favorit
 export const transfers = computed(() => [...store.transfers.values()].sort((a, b) => b.startedAtMs - a.startedAtMs));
 export const activeTransfers = computed(() => transfers.value.filter((t) => !isFinal(t.state)));
 
+/** What arrived, newest first: the Inbox's own list in the browser, received history elsewhere. */
+export const received = computed(() => (platform.inbox ? store.inbox : store.history.filter((h) => h.direction === "receive")));
+
 export function displayName(d: Pick<DeviceSummary, "alias" | "customAlias">) {
   return d.customAlias || d.alias;
 }
@@ -228,6 +399,7 @@ export function displayName(d: Pick<DeviceSummary, "alias" | "customAlias">) {
 // ── Actions ───────────────────────────────────────────────────────────────
 
 export async function respond(request: IncomingRequest, decision: Partial<Decision>) {
+  markAnswered(request.id);
   store.requests = store.requests.filter((r) => r.id !== request.id);
   await attempt(() =>
     platform.respond(request.id, { accept: null, decline: false, trust: false, saveDir: null, ...decision }),

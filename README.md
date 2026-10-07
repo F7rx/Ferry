@@ -26,9 +26,10 @@ LocalSend devices you already have, and adds resumable transfers, several
 incoming transfers at once, sending to many devices in one drop, Quick Drop onto
 device tiles, an Inbox, and a hardened security model.
 
-> **Status:** early but working. The desktop app (verified on Windows), the
-> `ferry` CLI and the browser app work end to end on the local network and over
-> WebRTC. Mobile builds are next.
+> **Status:** early but working. The desktop app, the `ferry` CLI and the
+> browser app work end to end on the local network and over WebRTC. The desktop
+> app is tested by hand on Windows; the macOS and Linux builds compile and pass
+> CI but haven't been tested by hand yet. Android and iOS apps are planned.
 
 ## Screenshots
 
@@ -53,7 +54,7 @@ device tiles, an Inbox, and a hardened security model.
 
 - **Works with LocalSend.** Discovery and transfers interoperate with unmodified LocalSend, in both directions.
 - **Encrypted by default.** HTTPS with mutual TLS and pinned certificates on the local network; DTLS over WebRTC beyond it.
-- **Resumable transfers.** A dropped network, a restarted receiver or a pause continues from the last confirmed byte.
+- **Resumable transfers.** A dropped network or a restarted receiver continues from the last confirmed byte, and sends on the local network can be paused and resumed.
 - **Group drop.** Send to several devices at once, each with its own progress.
 - **My devices.** Pair with a QR code, a link or a 6-digit code. Paired devices send to each other without prompts.
 - **Beyond your network.** With a self-hostable signaling server, devices and browsers connect peer to peer from anywhere. A private link or QR code connects two devices on different networks.
@@ -72,7 +73,8 @@ Installers for Windows, macOS and Linux are on the
 | macOS | `Ferry_x.y.z_universal.dmg` (Apple silicon and Intel) |
 | Linux | `.AppImage`, `.deb` or `.rpm` |
 
-The installers aren't code-signed yet. On Windows, SmartScreen may show
+Only the Windows installer has been tested by hand so far. The installers
+aren't code-signed yet. On Windows, SmartScreen may show
 "Windows protected your PC": select **More info**, then **Run anyway**. On
 macOS, if it says Apple can't check the app, open **System Settings ›
 Privacy & Security** and select **Open Anyway**.
@@ -81,7 +83,8 @@ Privacy & Security** and select **Open Anyway**.
 
 You need Rust 1.97 and Node 22 or newer.
 On Windows, install the MSVC build tools (WebView2 ships with Windows 11).
-On Linux, install the [Tauri system packages](https://v2.tauri.app/start/prerequisites/).
+On Linux, install the [Tauri system packages](https://v2.tauri.app/start/prerequisites/)
+(on Ubuntu 22.04: `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf`).
 
 ```sh
 npm install

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { ArrowDownLeft, ArrowUpRight, CircleAlert, ShieldCheck } from "@lucide/vue";
 import FButton from "../components/FButton.vue";
 import FIcon from "../components/FIcon.vue";
 import FSegmented from "../components/FSegmented.vue";
 import { attempt, store } from "../stores/engine";
+import { clearHistory } from "../stores/history";
 import { platform, type Direction, type HistoryEntry } from "../platform";
 import { clockTime, dayLabel, formatBytes } from "../lib/format";
 
@@ -39,11 +40,10 @@ const groups = computed(() => {
   return out;
 });
 async function clearAll() {
-  if (!confirm("Clear the whole history? Received files stay where they are.")) return;
-  await attempt(() => platform.clearHistory());
-  entries.value = [];
-  store.history = [];
+  // Shared flow: confirms, and only changes what's shown once clearing worked.
+  if (await clearHistory()) entries.value = [];
 }
+watch(() => store.historyRevision, () => load());
 </script>
 
 <template>

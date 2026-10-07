@@ -17,9 +17,13 @@ registerServiceWorker((apply) =>
 createApp(App).use(router).mount("#app");
 
 initEngine()
-  .then(async (snapshot) => {
-    // Files handed over on launch (e.g. Explorer "Send with Ferry").
-    if (native && snapshot.pendingPaths?.length) stage(await native.pathItems(snapshot.pendingPaths));
+  .then(async () => {
+    // Files handed over on launch (e.g. Explorer "Send with Ferry"): taken
+    // once, apart from the snapshot, so reloading state can't repeat them.
+    if (native) {
+      const paths = await native.takePendingPaths();
+      if (paths.length) stage(await native.pathItems(paths));
+    }
     // Shared into the installed PWA (Web Share Target).
     if (web) {
       const shared = await web.takeShared();

@@ -14,6 +14,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep in sync with rust-toolchain.toml (see CONTRIBUTING.md, "Setup").
   RUST_TOOLCHAIN: "1.97"
 
 jobs:
@@ -32,12 +33,17 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Format
+        # Formatting is platform independent; checking it once is enough.
         if: runner.os == 'Linux'
         run: cargo fmt -p ferry-core -p ferry-cli -p ferry-signal -p ferry-desktop -- --check
       - name: Clippy
-        run: cargo clippy -p ferry-core -p ferry-cli -p ferry-signal --all-targets -- -D warnings
+        run: cargo clippy --locked -p ferry-core -p ferry-cli -p ferry-signal --all-targets -- -D warnings
       - name: Test
-        run: cargo test --no-fail-fast -p ferry-core -p ferry-cli -p ferry-signal -p ferry-localsend --features ferry-localsend/full
+        # Test logs are captured per test and printed only for failures, so
+        # WebRTC and signaling debug output costs nothing when tests pass.
+        env:
+          FERRY_LOG: ferry_core::rtc=debug,ferry_signal=debug
+        run: cargo test --locked --no-fail-fast -p ferry-core -p ferry-cli -p ferry-signal -p ferry-localsend --features ferry-localsend/full
 
   web:
     name: Web app
@@ -57,8 +63,13 @@ jobs:
         run: npm run build -w apps/app
 
   desktop:
-    name: Desktop shell
-    runs-on: windows-latest
+    name: Desktop shell (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04 matches the release build (WebKitGTK 4.1 packages).
+        os: [windows-latest, ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -70,8 +81,93 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Linux packages
+        # Tauri links against WebKitGTK, GTK and AppIndicator on Linux only.
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - run: npm ci
       - name: Build frontend
+        # The shell embeds apps/app/dist at compile time, so build it first.
         run: npm run build:desktop -w apps/app
       - name: Clippy
-        run: cargo clippy -p ferry-desktop --all-targets -- -D warnings
+        run: cargo clippy --locked -p ferry-desktop --all-targets -- -D warnings
+      - name: Test
+        # Shell tests (tests/previews.rs) run against Tauri's mock runtime, so
+        # they need no display. build.rs embeds the Windows app manifest into
+        # test binaries on Windows (MSVC) only; other platforms need none.
+        run: cargo test --locked -p ferry-desktop
+
+  interop:
+    name: LocalSend interop
+    # Builds unmodified upstream LocalSend (pinned in scripts/fetch-upstream.sh)
+    # and runs it against Ferry over real TLS sockets on loopback. No multicast
+    # or LAN access is needed, so a hosted runner is enough.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A separate Cargo workspace with its own lock file and target dir.
+          workspaces: tests/interop -> target
+      - name: Fetch upstream LocalSend
+        run: sh scripts/fetch-upstream.sh
+      - name: Test
+        working-directory: tests/interop
+        run: cargo test --locked --no-fail-fast
+
+  e2e:
+    name: End to end (browser)
+    # Real Chrome (preinstalled on GitHub's Ubuntu runners) running the
+    # production PWA build, a real ferry-signal and the real ferry CLI, all on
+    # loopback: browser to browser over WebRTC, browser to native CLI over
+    # WebRTC, and the PWA checks (manifest, service worker, share target,
+    # offline shell). Set FERRY_E2E_CHANNEL=chromium and run
+    # `npx playwright install --with-deps chromium` to use Playwright's own
+    # browser instead.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FERRY_E2E_CHANNEL: chrome
+      SHOTS: ${{ github.workspace }}/e2e-shots
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - name: Build ferry and ferry-signal
+        id: build
+        run: cargo build --locked --release -p ferry-cli -p ferry-signal
+      - name: Browser to browser
+        timeout-minutes: 15
+        run: node apps/app/scripts/e2e-web.mjs "$SHOTS/web"
+        env:
+          FERRY_SIGNAL_BIN: target/release/ferry-signal
+      - name: Browser to native CLI
+        # Run even when the previous scenario failed, as long as the build passed.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: node apps/app/scripts/e2e-native-web.mjs "$SHOTS/native-web"
+      - name: PWA
+        # Run even when the previous scenario failed, as long as the build passed.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        run: node apps/app/scripts/e2e-pwa.mjs "$SHOTS/pwa"
+      - name: Upload screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: e2e-shots
+          if-no-files-found: ignore
+          retention-days: 7

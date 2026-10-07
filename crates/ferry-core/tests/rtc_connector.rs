@@ -80,7 +80,7 @@ async fn native_peers_connect_through_signaling() {
         .await
         .unwrap();
     let mut answered = answering.await.unwrap().unwrap();
-    eprintln!("connected in {:?}, relayed={} remote={:?}", started.elapsed(), connected.relayed, connected.remote_address);
+    eprintln!("connected in {:?}, relayed={:?} remote={:?}", started.elapsed(), connected.relayed, connected.remote_address);
     assert_eq!(connected.session.peer().unwrap().key, b.identity.public_key());
     assert_eq!(answered.session.peer().unwrap().short_code, connected.session.peer().unwrap().short_code);
 
@@ -101,6 +101,34 @@ async fn native_peers_connect_through_signaling() {
     assert!(!outcome.declined);
     connected.session.close(None);
     tokio::time::timeout(Duration::from_secs(10), answered.session.closed()).await.expect("remote side sees the close");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_to_a_departed_client_fails_fast() {
+    let url = signal_server().await;
+    let mut a = side(&url, "A");
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), a.events.recv()).await.unwrap().unwrap();
+        if matches!(ev, SignalingEvent::Hello { .. }) {
+            break;
+        }
+    }
+    let a_connector = a.connector.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = a.events.recv().await {
+            a_connector.handle_signal(&ev);
+        }
+    });
+    // A client id the server doesn't know: it answers 404, which ends the
+    // attempt well before the 30 s connect timeout.
+    let gone = uuid::Uuid::new_v4().to_string();
+    let options = ConnectOptions { expected_peer_key: None, room_secret: None, ice_servers: vec![] };
+    let err = tokio::time::timeout(Duration::from_secs(10), a.connector.connect(&gone, options))
+        .await
+        .expect("fails without waiting for the connect timeout")
+        .err()
+        .expect("no such client");
+    assert_eq!(err.code, "gone", "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,11 +1,11 @@
 <script setup lang="ts">
 // Everything received, with previews and the actions people actually use.
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { Copy, Download, ExternalLink, FolderOpen, Grid2x2, List, Search, ShieldCheck, Trash2 } from "@lucide/vue";
 import FButton from "../components/FButton.vue";
 import FIcon from "../components/FIcon.vue";
 import FSegmented from "../components/FSegmented.vue";
-import { attempt, store, toast } from "../stores/engine";
+import { attempt, received, store, toast } from "../stores/engine";
 import { platform, type HistoryEntry } from "../platform";
 import { fileKind, formatBytes, isUrl, relativeTime } from "../lib/format";
 import { fileIcon } from "../lib/icons";
@@ -16,13 +16,17 @@ const view = ref<"grid" | "list">("grid");
 const query = ref("");
 const items = ref<HistoryEntry[]>([]);
 
-onMounted(async () => {
-  items.value = (await attempt(() => platform.history(400, undefined, "receive"))) ?? [];
-});
+// The browser keeps its own Inbox list (files stay listed while history is off).
+const listInbox = (limit: number) => (platform.inbox ? platform.inbox(limit) : platform.history(limit, undefined, "receive"));
+async function load() {
+  items.value = (await attempt(() => listInbox(400))) ?? [];
+}
+onMounted(load);
+watch(() => store.historyRevision, load);
 // New arrivals stream in from engine events.
 const all = computed(() => {
   const seen = new Set(items.value.map((i) => i.id));
-  const fresh = store.history.filter((h) => h.direction === "receive" && !seen.has(h.id));
+  const fresh = received.value.filter((h) => !seen.has(h.id));
   return [...fresh, ...items.value];
 });
 const visible = computed(() => {
@@ -61,8 +65,8 @@ function preview(h: HistoryEntry) {
 async function remove(h: HistoryEntry) {
   if (await attempt(() => platform.deleteHistory(h.id))) {
     items.value = items.value.filter((i) => i.id !== h.id);
-    const i = store.history.findIndex((x) => x.id === h.id);
-    if (i >= 0) store.history.splice(i, 1);
+    store.history = store.history.filter((x) => x.id !== h.id);
+    store.inbox = store.inbox.filter((x) => x.id !== h.id);
   }
 }
 const canReveal = platform.capabilities.revealInFolder;

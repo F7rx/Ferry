@@ -8,6 +8,7 @@ import FSegmented from "../components/FSegmented.vue";
 import FToggle from "../components/FToggle.vue";
 import { appearance } from "../lib/appearance";
 import { attempt, saveSettings, store, toast } from "../stores/engine";
+import { clearHistory, clearHistoryDetail, deleteReceivedFiles, keepsReceivedFiles } from "../stores/history";
 import { isNative, platform, type AutoAccept } from "../platform";
 
 const route = useRoute();
@@ -88,14 +89,6 @@ async function saveStun() {
   const list = stun.value.split(/[\s,]+/).filter(Boolean);
   if (list.some((u) => !/^(stun|turn)s?:/.test(u))) return toast({ level: "error", title: "Use stun: or turn: addresses" });
   if (list.join() !== s.value?.stunServers.join()) await commit("stunServers", list);
-}
-async function clearHistory() {
-  const question = isWeb
-    ? "Clear the whole history? This also deletes the received files kept in this browser."
-    : "Clear the whole history? Received files stay where they are.";
-  if (!confirm(question)) return;
-  await attempt(() => platform.clearHistory());
-  store.history = [];
 }
 const acceptOptions: { value: AutoAccept; label: string }[] = [
   { value: "off", label: "Always ask" },
@@ -192,16 +185,23 @@ const acceptOptions: { value: AutoAccept; label: string }[] = [
             <FToggle :model-value="s.encryption" label="Encryption" @update:model-value="setEncryption" />
           </div>
           <div class="row">
-            <span class="label"><strong>Keep a history</strong><span>File names, sizes and devices, never file contents.</span></span>
+            <span class="label">
+              <strong>Keep a history</strong>
+              <span>{{ keepsReceivedFiles ? "File names, sizes and devices, never file contents. Off: only the Inbox's list of files received in this browser is kept." : "File names, sizes and devices, never file contents." }}</span>
+            </span>
             <FToggle :model-value="s.historyEnabled" label="Keep a history" @update:model-value="(v) => saveSettings({ historyEnabled: v })" />
           </div>
           <div class="row">
-            <span class="label"><strong>Remember message text</strong><span>Off: history shows that a message arrived, not what it said.</span></span>
-            <FToggle :model-value="s.keepMessageText" label="Remember message text" @update:model-value="(v) => saveSettings({ keepMessageText: v })" />
+            <span class="label"><strong>Remember message text</strong><span>Off: history shows that a message arrived, not what it said. Needs Keep a history.</span></span>
+            <FToggle :model-value="s.keepMessageText" :disabled="!s.historyEnabled" label="Remember message text" @update:model-value="(v) => saveSettings({ keepMessageText: v })" />
           </div>
           <div class="row">
-            <span class="label"><strong>Clear history</strong><span>{{ isWeb ? "Also deletes received files kept in this browser." : "Received files stay where they are." }}</span></span>
+            <span class="label"><strong>Clear history</strong><span>{{ clearHistoryDetail }}</span></span>
             <FButton size="sm" variant="danger" @click="clearHistory">Clear</FButton>
+          </div>
+          <div v-if="keepsReceivedFiles" class="row">
+            <span class="label"><strong>Delete received files</strong><span>Deletes every file kept in this browser. Save the ones you need from the Inbox first.</span></span>
+            <FButton size="sm" variant="danger" @click="deleteReceivedFiles">Delete files</FButton>
           </div>
           <p class="note"><FIcon :icon="Info" :size="13" /> Ferry sends no analytics or crash reports, and has no account. Files go directly between your devices.</p>
         </template>

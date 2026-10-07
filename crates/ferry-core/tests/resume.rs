@@ -109,17 +109,29 @@ async fn pause_and_resume_by_user() {
     let path = write_file(src.path(), "photos.zip", &data);
     let ids = tx.engine.send(vec![via(&proxy, rx.engine.fingerprint())], vec![SendItem::Path { path }]).await.unwrap();
 
-    tx.wait_transfer(T, |t| t.id == ids[0] && t.bytes_done > 4 * MIB).await;
+    let sending = tx.wait_transfer(T, |t| t.id == ids[0] && t.bytes_done > 4 * MIB).await;
+    // The UI offers Pause and Resume for this LAN send; the receiving side can't pause.
+    assert!(sending.can_pause && sending.can_resume, "{sending:?}");
+    let receiving = rx.wait_transfer(T, |t| t.direction == Direction::Receive && t.state == TransferState::Transferring).await;
+    assert!(!receiving.can_pause && !receiving.can_resume, "{receiving:?}");
+    assert!(!rx.engine.pause(&receiving.id), "receives can't be paused");
+
     assert!(tx.engine.pause(&ids[0]));
-    tx.wait_transfer(T, |t| t.id == ids[0] && t.state == TransferState::Paused).await;
+    let paused = tx.wait_transfer(T, |t| t.id == ids[0] && t.state == TransferState::Paused).await;
+    assert!(paused.can_resume, "{paused:?}");
     // Bytes already in socket buffers still drain after the pause (several MB
     // with Linux autotuning); measure once they have.
     tokio::time::sleep(Duration::from_millis(1000)).await;
     let at_pause = proxy.upstream_bytes();
+    let done_at_pause = tx.engine.transfers().into_iter().find(|t| t.id == ids[0]).unwrap().bytes_done;
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(proxy.upstream_bytes() - at_pause < MIB, "paused transfer kept sending");
+    let still = tx.engine.transfers().into_iter().find(|t| t.id == ids[0]).unwrap();
+    assert_eq!(still.state, TransferState::Paused);
+    assert!(still.bytes_done <= done_at_pause + MIB, "progress kept growing while paused");
 
     assert!(tx.engine.resume(&ids[0]));
+    assert!(!tx.engine.resume(&ids[0]), "a second resume is a no-op");
     let done = tx.wait_final(&ids[0], Duration::from_secs(60)).await;
     assert_eq!(done.state, TransferState::Completed, "{:?}", done.error);
     rx.wait_received(T).await;

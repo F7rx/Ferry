@@ -157,8 +157,8 @@ pub struct Connected {
     pub events: mpsc::UnboundedReceiver<SessionEvent>,
     pub peer_client_id: String,
     pub role: Role,
-    /// Through a TURN relay.
-    pub relayed: bool,
+    /// Through a TURN relay; `None` when the selected candidate pair is unknown.
+    pub relayed: Option<bool>,
     /// The remote candidate's address (`ip:port`), when known.
     pub remote_address: Option<String>,
 }
@@ -249,6 +249,20 @@ impl Connector {
             }
             SignalingEvent::Cancel { peer, session_id } => {
                 self.fail(&peer.id, session_id, RtcError::new("cancelled", "the peer cancelled"), false);
+                None
+            }
+            // The server couldn't route our offer: that connection of the peer
+            // is gone (it left, or reconnected under a new id). Fail the attempt
+            // now so the caller can look the peer up again, instead of waiting
+            // for the connect timeout.
+            SignalingEvent::Error { code, session_id: Some(session_id), .. } if code.as_u64() == Some(404) => {
+                let peers: Vec<String> = {
+                    let entries = self.entries.lock().unwrap();
+                    entries.iter().filter(|((_, s), e)| s == session_id && e.session.is_none()).map(|((p, _), _)| p.clone()).collect()
+                };
+                for peer in peers {
+                    self.fail(&peer, session_id, RtcError::new("gone", "the device is no longer at that address"), false);
+                }
                 None
             }
             _ => None,
@@ -589,15 +603,24 @@ async fn add_ice(pc: &RTCPeerConnection, c: &IceCandidate, mid: &str) {
     }
 }
 
-/// Whether the selected candidate pair goes through a TURN relay, and the remote address.
-async fn selected_pair(pc: &RTCPeerConnection) -> (bool, Option<String>) {
+/// Whether the selected candidate pair goes through a TURN relay (`None` when
+/// there is no selected pair or its candidate types can't be read), and the
+/// remote address.
+async fn selected_pair(pc: &RTCPeerConnection) -> (Option<bool>, Option<String>) {
     let pair = pc.sctp().transport().ice_transport().get_selected_candidate_pair().await;
-    let Some(pair) = pair else { return (false, None) };
-    // Display: "(local) <proto> <type> <addr>:<port> <-> (remote) <proto> <type> <addr>:<port>"
-    let text = pair.to_string();
-    let (local, remote) = text.split_once(" <-> ").unwrap_or((&text, ""));
+    match pair {
+        Some(pair) => route_of(&pair.to_string()),
+        None => (None, None),
+    }
+}
+
+/// [`selected_pair`] from the pair's display text:
+/// "(local) <proto> <type> <addr>:<port> <-> (remote) <proto> <type> <addr>:<port>".
+fn route_of(text: &str) -> (Option<bool>, Option<String>) {
+    let (local, remote) = text.split_once(" <-> ").unwrap_or((text, ""));
     let typ = |s: &str| s.split_whitespace().nth(2).unwrap_or("").to_string();
-    let relayed = typ(local) == "relay" || typ(remote) == "relay";
+    let (local_type, remote_type) = (typ(local), typ(remote));
+    let relayed = (!local_type.is_empty() && !remote_type.is_empty()).then(|| local_type == "relay" || remote_type == "relay");
     // "<addr>:<port>" (a related address may follow without a separator).
     let address = remote.split_whitespace().nth(3).and_then(|a| {
         let colon = a.rfind(':')?;
@@ -605,4 +628,20 @@ async fn selected_pair(pc: &RTCPeerConnection) -> (bool, Option<String>) {
         (!port.is_empty()).then(|| format!("{}:{port}", &a[..colon]))
     });
     (relayed, address)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::route_of;
+
+    #[test]
+    fn route_is_known_only_from_both_candidate_types() {
+        let direct = "(local) udp host 192.168.1.2:5000 <-> (remote) udp srflx 203.0.113.9:6000";
+        assert_eq!(route_of(direct), (Some(false), Some("203.0.113.9:6000".into())));
+        let relayed = "(local) udp relay 198.51.100.1:7000 related 192.168.1.2:5000 <-> (remote) udp host 10.0.0.3:9";
+        assert_eq!(route_of(relayed).0, Some(true));
+        assert_eq!(route_of("(local) udp host 1.2.3.4:5 <-> (remote) udp relay [2001:db8::1]:3478").0, Some(true));
+        assert_eq!(route_of(""), (None, None), "nothing to read: unknown, not direct");
+        assert_eq!(route_of("(local) udp host 1.2.3.4:5").0, None);
+    }
 }

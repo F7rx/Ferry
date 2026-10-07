@@ -72,7 +72,8 @@ export interface ConnectionInfo {
   transport: "lan" | "webrtc" | "browser" | string;
   encrypted: boolean;
   ipVersion: number | null;
-  relayed: boolean;
+  /** Through a TURN relay; null when the route isn't known (the browser didn't report it). */
+  relayed: boolean | null;
   address: string | null;
 }
 
@@ -102,7 +103,12 @@ export interface TransferSummary {
   startedAtMs: number;
   finishedAtMs: number | null;
   connection: ConnectionInfo | null;
+  /** Continues where it stopped after a lost connection (automatic; not a user action). */
   resumable: boolean;
+  /** The user can pause it while it is transferring. */
+  canPause: boolean;
+  /** The user can resume it once paused. */
+  canResume: boolean;
   title: string;
   text: string | null;
   error: ErrorInfo | null;
@@ -255,6 +261,8 @@ export type EngineEvent =
   | { type: "transferFilesUpdated"; id: string; files: TransferFile[] }
   | { type: "transferRemoved"; id: string }
   | { type: "historyAdded"; entry: HistoryEntry }
+  /** Browser: something new for the Inbox (it lists received files even while history is off). */
+  | { type: "inboxAdded"; entry: HistoryEntry }
   | { type: "serverStatus"; running: boolean; port: number; error: string | null }
   | { type: "notice"; level: NoticeLevel; code: string; message: string }
   | { type: "browserShareUpdated"; share: BrowserLink }
@@ -283,6 +291,12 @@ export interface Snapshot {
   transfers: TransferSummary[];
   settings: Settings;
   server: { running: boolean; port: number; error: string | null };
+  /** Engines that can be reloaded after missed events also return what is open now. */
+  pendingRequests?: IncomingRequest[];
+  pairingRequests?: PairingRequest[];
+  rooms?: RoomInfo[];
+  signaling?: SignalingStatus;
+  browserLinks?: BrowserLink[];
 }
 
 export interface DiagnosticCheck {
@@ -315,7 +329,12 @@ export interface Capabilities {
 export interface Platform {
   readonly capabilities: Capabilities;
   init(): Promise<Snapshot>;
-  subscribe(handler: (event: EngineEvent) => void): () => void;
+  /**
+   * Delivers engine events; returns the unsubscribe function, or a promise of
+   * it that resolves once the listeners are installed. `onResync` runs when
+   * events were missed and the state must be reloaded with `init`.
+   */
+  subscribe(handler: (event: EngineEvent) => void, onResync?: () => void): (() => void) | Promise<() => void>;
 
   send(targets: SendTarget[], items: OutgoingItem[]): Promise<string[]>;
   respond(requestId: string, decision: Decision): Promise<boolean>;
@@ -345,7 +364,16 @@ export interface Platform {
 
   history(limit: number, beforeId?: number, direction?: Direction): Promise<HistoryEntry[]>;
   deleteHistory(id: number): Promise<boolean>;
+  /** Clears the activity history. Never deletes received files (native: they stay on disk; browser: they stay in the Inbox). */
   clearHistory(): Promise<void>;
+  /**
+   * Browser only: the Inbox's own list (received files, kept whatever the
+   * history settings, plus received messages history kept). Without it the
+   * Inbox shows received history entries.
+   */
+  inbox?(limit: number, beforeId?: number): Promise<HistoryEntry[]>;
+  /** Browser only: deletes every file received in this browser. */
+  clearReceivedFiles?(): Promise<{ deleted: number; failed: number }>;
 
   updateSettings(settings: Settings): Promise<Settings>;
 

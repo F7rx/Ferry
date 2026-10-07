@@ -571,6 +571,8 @@ export class FakePeerConnection {
   static readonly all = new Map<string, FakePeerConnection>();
   /** Network model for the data channels created on connect. */
   static channelOptions: PairOptions = {};
+  /** What `getStats()` reports for every connection (null: it fails, like a browser that won't say). */
+  static stats: Map<string, Record<string, unknown>> | null = null;
 
   readonly id = randomId();
   readonly fingerprint = fakeFingerprint();
@@ -625,6 +627,11 @@ export class FakePeerConnection {
 
   async addIceCandidate(candidate?: RTCIceCandidateInit): Promise<void> {
     this.remoteCandidates.push(candidate ?? null);
+  }
+
+  async getStats(): Promise<Map<string, Record<string, unknown>>> {
+    if (!FakePeerConnection.stats) throw new Error("NotSupportedError: no stats");
+    return FakePeerConnection.stats;
   }
 
   close(): void {

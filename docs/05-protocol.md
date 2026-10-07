@@ -28,7 +28,7 @@ Every v2 DTO Ferry *sends* (multicast announcement, `register` request/response,
 `info`, `prepare-upload.info`) carries:
 
 ```json
-"ferry": { "v": 1, "caps": ["resume", "verify", "batch", "pair", "status"] }
+"ferry": { "v": 1, "caps": ["resume", "verify", "status", "pair"] }
 ```
 
 This is a hint only (it is unauthenticated on multicast). Before using any
@@ -65,8 +65,10 @@ Response gains:
 - When a sender reconnects (network loss, sleep, either app restarted) it sends
   the **same `transferId`** again. If the receiver has that transfer persisted
   for the *same verified fingerprint*, it accepts **without prompting** and
-  returns fresh `sessionId`/tokens plus the confirmed byte offset of every
-  unfinished file. Finished files are omitted from `files`.
+  returns the session's `sessionId`/tokens (fresh ones when the transfer was
+  restored after a restart) plus the confirmed byte offset of every
+  unfinished file. Finished files are omitted from `files`; if every file is
+  finished it answers **204**.
 - Upload with an offset:
 
   ```
@@ -78,6 +80,34 @@ Response gains:
   ≥ the requested offset. If the requested offset is beyond what it has,
   it answers **416** `{"message":"offset mismatch","offset":<confirmed>}` and
   the sender restarts from `offset`.
+- A resumed transfer keeps what the user approved, also across a receiver
+  restart: the receiver stores the whole approved offer (ids, names, sizes,
+  types and announced `sha256` of the accepted files and of the declined ones)
+  and the save folder the user chose. The re-offer is checked against it:
+  - it may list fewer files (a sender re-offers only what it hasn't finished,
+    declined files included; those still get no token);
+  - every listed file must be an approved one with the same name, size and
+    type; its `sha256` may be omitted (the approved one still applies) but not
+    changed, nor added where none was approved.
+
+  Anything else is refused with **400** `Files differ from the accepted
+  transfer` (the stored transfer is kept; there is no new prompt, since a
+  sender reusing a `transferId` must send the same files). With checksum
+  verification on, a completed file that doesn't match the approved
+  `sha256` is answered **422**, its data deleted, and it starts again from
+  offset 0; a file gets three attempts in total, counted across restarts.
+- A restored transfer writes only into the folder that was approved for it,
+  even if the default save folder changed since. If that folder no longer
+  exists (it is never recreated) or a stored partial file lies outside it,
+  the stored transfer is forgotten (its partial files are not touched) and
+  the request is treated as new (the user is asked again). Transfers stored by older versions, which recorded
+  neither the folder nor checksums nor declined files, resume only if their
+  partial files are inside the current default folder; ids they don't know
+  are ignored rather than refused, and a `sha256` in the re-offer counts as
+  added.
+- A restored transfer needs a free session slot like a new one (409 when the
+  peer or the receiver as a whole is at its cap); a sender reconnecting to a session still in memory
+  reuses that session's slot.
 - Receivers persist resumable transfers for **24 h** after the last activity,
   then delete the partial files and forget the transfer.
 - `GET /api/ferry/v1/transfers/<transferId>` ← `{"files":{"<fileId>":{"offset":n,"done":bool}}}`
@@ -103,7 +133,10 @@ senders do not: both sides hash while streaming.
 - Incoming LocalSend transfers that include `sha256` are verified with the
   standard 422 behaviour.
 
-### 3.3 Batched small files (`batch`)
+### 3.3 Batched small files (`batch`, Planned)
+
+Not implemented yet: no Ferry device advertises `batch` or serves this route.
+The design:
 
 ```
 POST /api/ferry/v1/upload-batch?sessionId=…
@@ -307,6 +340,13 @@ the same `transferId` again; the receiver resumes with `offsets`.
   TLS identity) and list WebRTC peers as `rtc:<base64url identity key>`; every
   session pins the key the peer announced in `ext.key`, so trust set on such a
   device id is bound to that key.
+- `text` with files: receivers show (and record in history) the text only
+  after the user accepts at least one file, once per peer and transfer (not
+  again for a resumed re-offer); a declined offer's text is never shown. Native
+  senders never combine text and files; each text is its own transfer.
+- Native WebRTC resume works from memory only: it survives a dropped
+  connection but not an app restart, and a re-offer is matched by file id,
+  name and size. LAN resume (§3.1) is the persisted one.
 
 ### 5.3 LocalSend web compatibility (`ls-v1`)
 

@@ -10,7 +10,9 @@ import {
   PeerConnector,
   randomBytes,
   randomId,
+  relayedOf,
   roomIdFromSecret,
+  RtcError,
   b64urlEncode,
   serializeForIdb,
   SignalingClient,
@@ -23,6 +25,7 @@ import {
   type SinkContext,
   type SourceFile,
   type TransferRequest,
+  type WebSocketFactory,
 } from "../lib/rtc";
 import { tryB64urlDecode } from "../lib/rtc/bytes";
 import { store } from "../lib/idb";
@@ -66,8 +69,12 @@ interface KnownDevice {
 }
 
 interface Tracked {
+  /** `summary.id` is this device's own random id for the transfer, never the peer's. */
   summary: TransferSummary;
+  /** The transfer id on the wire (chosen by the sender): used in cancel/resume messages and resume records. */
+  wireId: string;
   files: TransferFile[];
+  /** The session driving it now; events from any other session are ignored. */
   session: PeerSession | null;
   /** Bytes per file id, for progress. */
   done: Map<string, number>;
@@ -79,6 +86,8 @@ interface Tracked {
   request?: TransferRequest;
   retrying?: boolean;
   attempts?: number;
+  /** Sender: file ids already written to history, so a transfer that is tried again never lists a file twice. */
+  recorded?: Set<string>;
   userCancelled?: boolean;
   /** Receiver: gives up waiting for the sender to come back. */
   giveUp?: ReturnType<typeof setTimeout>;
@@ -93,6 +102,17 @@ interface ResumeRecord {
   /** Chosen by this receiver and mixed into storage ids, so a peer can't aim a new transfer at stored files. */
   nonce: string;
   at: number;
+}
+
+/**
+ * A history record as stored. `inbox`: a received file the Inbox lists (kept
+ * whatever the history settings, so the file stays reachable). `activity`: an
+ * entry the History page shows (only kept while history is on). Version 1
+ * records carry neither flag; see `isInboxFile` / `isActivity`.
+ */
+interface StoredEntry extends HistoryEntry {
+  inbox?: boolean;
+  activity?: boolean;
 }
 
 /** A private link room: devices that opened the same link see each other anywhere. */
@@ -113,7 +133,16 @@ interface Pending {
 
 const kv = store<unknown>("kv");
 const knownDb = store<KnownDevice>("devices");
-const historyDb = store<HistoryEntry>("history");
+const historyDb = store<StoredEntry>("history");
+
+const isInboxFile = (e: StoredEntry) => e.inbox ?? (e.direction === "receive" && e.kind === "file" && !!e.path);
+const isActivity = (e: StoredEntry) => e.activity ?? true;
+/** What the Inbox lists: received files, and received messages while they are kept in history. */
+const inInbox = (e: StoredEntry) => e.direction === "receive" && (isInboxFile(e) || (e.kind === "text" && isActivity(e)));
+function plain(e: StoredEntry): HistoryEntry {
+  const { inbox: _inbox, activity: _activity, ...entry } = e;
+  return entry;
+}
 
 const fail = (code: string, message: string, hint?: string) => ({ code, message, hint });
 const unsupported = (what: string) => fail("unsupported", `${what} isn't available in the browser.`, "Install the Ferry app for this.");
@@ -133,6 +162,17 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MAX_INBOUND_PER_PEER = 2;
 const MAX_PENDING_PER_PEER = 3;
 const MAX_PENDING = 16;
+/** Messages admitted per peer / overall within MESSAGE_WINDOW_MS; more are declined. */
+const MAX_MESSAGES_PER_PEER = 10;
+const MAX_MESSAGES = 30;
+const MESSAGE_WINDOW_MS = 60_000;
+/** Messages remembered (peer, transfer id) so a re-sent transfer doesn't show its text twice. */
+const MAX_DELIVERED = 256;
+/** Finished transfers kept in memory; older ones are dismissed. */
+const MAX_FINISHED = 50;
+/** Startup cleanup leaves files written this recently alone (another tab may be receiving them). */
+const PRUNE_GRACE_MS = 15 * 60_000;
+const PAGE = 500;
 /** Types a received file may be opened as in a tab; anything else is saved instead (never HTML/SVG/XML on our origin). */
 const INLINE_SAFE = /^(image\/(png|jpeg|gif|webp|avif)|video\/(mp4|webm|ogg)|audio\/(mpeg|mp4|ogg|wav|webm|flac)|application\/pdf|text\/plain)$/;
 const RASTER = /^image\/(png|jpeg|gif|webp|avif)$/;
@@ -256,7 +296,24 @@ function pickInput(options: { multiple?: boolean; directory?: boolean }): Promis
   });
 }
 
-export function createWebPlatform(): Platform & { takeShared(): Promise<OutgoingItem[]> } {
+/** Test seams: a fake signaling server and RTCPeerConnection. */
+export interface WebPlatformOptions {
+  WebSocket?: WebSocketFactory;
+  RTCPeerConnection?: typeof RTCPeerConnection;
+  /** Delays between automatic reconnect attempts of a send (default RETRY_DELAYS_MS). */
+  retryDelaysMs?: readonly number[];
+}
+
+/** The first line of a message, short enough for a list. */
+function firstLine(text: string): string {
+  return text.trim().split("\n")[0]!.trim().slice(0, 80) || "Message";
+}
+
+export function createWebPlatform(options: WebPlatformOptions = {}): Platform & {
+  takeShared(): Promise<OutgoingItem[]>;
+  inbox(limit: number, beforeId?: number): Promise<HistoryEntry[]>;
+  clearReceivedFiles(): Promise<{ deleted: number; failed: number }>;
+} {
   const capabilities: Capabilities = {
     kind: "web",
     lanDiscovery: false,
@@ -291,16 +348,24 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
   const rooms = new Map<string, Room>();
   const sessions = new Map<string, PeerSession>();
   const connecting = new Map<string, Promise<PeerSession>>();
+  /** Every live transfer by its own (UI) id. */
   const transfers = new Map<string, Tracked>();
+  /** The same transfers by (authenticated peer key, direction, wire id): what session events are matched on. */
+  const byWire = new Map<string, Tracked>();
   const pending = new Map<string, Pending>();
   /** Object URLs for received images (previews), by history path. */
   const previews = new Map<string, string>();
-  let historyCache: HistoryEntry[] = [];
-  let historySeq = 0;
   let resumeRecords: ResumeRecord[] = [];
   /** Storage nonce per accepted transfer ("<peer key> <transfer id>"). */
   const nonces = new Map<string, string>();
   const inbound = new Map<string, number>();
+  /** The RTCPeerConnection under each session, and whether it is relayed (from its stats). */
+  const connections = new WeakMap<PeerSession, RTCPeerConnection | null>();
+  const routes = new WeakMap<PeerSession, Promise<boolean | null>>();
+  /** When messages were admitted, per peer key. */
+  const messageTimes = new Map<string, number[]>();
+  /** "<peer key> <transfer id>" of messages already shown, oldest first. */
+  const delivered = new Set<string>();
 
   // ── Devices ─────────────────────────────────────────────────────────────
 
@@ -465,6 +530,17 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
     };
   }
 
+  function currentSignaling(): SignalingStatus {
+    const status = serverStatus();
+    return { url: signalingUrl(settings), state: signalingState, error: status.error, identityKey: publicKey };
+  }
+
+  /** Tells the UI about the signaling connection (both the legacy server status and the typed status). */
+  function emitSignaling() {
+    emit({ type: "serverStatus", ...serverStatus() });
+    emit({ type: "signalingStatus", status: currentSignaling() });
+  }
+
   function iceServers(): () => Promise<RTCIceServer[]> {
     return async () => {
       const servers: RTCIceServer[] = settings.stunServers.length ? [{ urls: settings.stunServers }] : [];
@@ -478,7 +554,10 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
 
   function startSignaling() {
     connector?.dispose();
-    signaling?.close();
+    // Detach before closing, so the old client's last "closed" isn't reported as the new one's.
+    const previous = signaling;
+    signaling = null;
+    previous?.close();
     present.clear();
     nearby.clear();
     sessions.clear();
@@ -486,30 +565,38 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
     const client = new SignalingClient({
       url: signalingUrl(settings),
       info: { alias: settings.alias, deviceType: "web", deviceModel: browserName(), token: randomId(), publicKey },
+      ...(options.WebSocket ? { WebSocket: options.WebSocket } : {}),
     });
     signaling = client;
+    // A replaced client may still report (its close, a late message): only the current one counts.
+    const live = () => signaling === client;
+    // `connect()` below reports "connecting" right away.
+    signalingState = client.state;
     client.on("state", (state) => {
+      if (!live()) return;
       signalingState = state;
-      emit({ type: "serverStatus", ...serverStatus() });
+      emitSignaling();
       if (state !== "open") clearPresence();
     });
     client.on("hello", ({ peers }) => {
+      if (!live()) return;
       for (const key of [...nearby]) {
         nearby.delete(key);
         drop(key);
       }
       peers.forEach((p) => seen(p));
     });
-    client.on("join", ({ peer }) => seen(peer));
+    client.on("join", ({ peer }) => live() && seen(peer));
     client.on("update", ({ peer }) => {
+      if (!live()) return;
       const key = keyOf(peer);
       const room = key && !nearby.has(key) ? roomOf(key) : undefined;
       seen(peer, room);
     });
-    client.on("left", ({ peerId }) => gone(peerId));
+    client.on("left", ({ peerId }) => live() && gone(peerId));
     client.on("roomHello", ({ room: id, peers }) => {
       const room = rooms.get(id);
-      if (!room) return;
+      if (!room || !live()) return;
       for (const key of [...room.peers]) {
         room.peers.delete(key);
         drop(key);
@@ -519,29 +606,36 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
     });
     client.on("roomPeerJoined", ({ room: id, peer }) => {
       const room = rooms.get(id);
-      if (room) seen(peer, room);
+      if (room && live()) seen(peer, room);
     });
     client.on("roomPeerLeft", ({ room: id, peerId }) => {
       const room = rooms.get(id);
-      if (room) gone(peerId, room);
+      if (room && live()) gone(peerId, room);
     });
     for (const room of rooms.values()) {
       room.peers.clear();
       client.joinRoom(room.id);
     }
 
-    const sink = createBrowserSink(onCommitted, (context) => nonces.get(`${context.peerKey} ${context.transferId}`) ?? "");
-    connector = new PeerConnector({
+    const sink = createBrowserSink(onCommitted, (context) => {
+      const nonce = nonces.get(`${context.peerKey} ${context.transferId}`);
+      // Every accepted transfer has one; without it the storage id would be guessable.
+      if (!nonce) throw new RtcError("invalid-state", "This transfer wasn't accepted here");
+      return nonce;
+    });
+    const current = new PeerConnector({
       signaling: client,
       identity,
       device: { alias: settings.alias, deviceType: "web", platform: "browser" },
       sink,
       iceServers: iceServers(),
       session: { decisionTimeoutMs: settings.decisionTimeoutSecs * 1000 },
+      ...(options.RTCPeerConnection ? { RTCPeerConnection: options.RTCPeerConnection } : {}),
     });
-    connector.on("incoming", (request) => {
+    connector = current;
+    current.on("incoming", (request) => {
       const key = keyOf(request.peer);
-      if (!key || !settings.receiveEnabled) return request.reject();
+      if (!key || !settings.receiveEnabled || connector !== current) return request.reject();
       if ((inbound.get(key) ?? 0) >= MAX_INBOUND_PER_PEER) return request.reject();
       inbound.set(key, (inbound.get(key) ?? 0) + 1);
       const release = () => inbound.set(key, Math.max(0, (inbound.get(key) ?? 1) - 1));
@@ -552,8 +646,19 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
         .then((session) => session.on("closed", release))
         .catch(release);
     });
-    connector.on("session", ({ session }) => wire(session));
+    current.on("session", ({ session, connection }) => {
+      connections.set(session, connection);
+      wire(session);
+    });
     client.connect();
+  }
+
+  /** The transfer a session event is about: same authenticated peer, direction and wire id, and driven by this very session. */
+  function trackedFor(session: PeerSession, direction: Direction, wireId: string): Tracked | undefined {
+    const key = session.peer?.key;
+    if (!key) return undefined;
+    const t = byWire.get(wireKey(key, direction, wireId));
+    return t && t.session === session ? t : undefined;
   }
 
   function wire(session: PeerSession) {
@@ -570,10 +675,10 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
         }
       })
       .catch(() => {});
-    session.on("offer", (offer) => onOffer(session, offer));
+    session.on("offer", (offer) => void onOffer(session, offer));
     session.on("accepted", (a) => {
-      const t = transfers.get(a.transferId);
-      if (!t) return;
+      const t = trackedFor(session, "send", a.transferId);
+      if (!t || isFinal(t.summary.state)) return;
       const accepted = new Set(a.files);
       t.files = t.files.map((f) => (accepted.has(f.id) ? { ...f, state: "transferring" } : { ...f, state: "skipped" }));
       t.summary.fileCount = a.files.length;
@@ -582,8 +687,8 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       update(t, { state: "transferring" });
     });
     session.on("progress", (p) => {
-      const t = transfers.get(p.transferId);
-      if (!t) return;
+      const t = trackedFor(session, p.direction, p.transferId);
+      if (!t || isFinal(t.summary.state)) return;
       t.done.set(p.fileId, p.bytes);
       const f = t.files.find((x) => x.id === p.fileId);
       if (f) f.bytesDone = p.bytes;
@@ -598,8 +703,8 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       update(t, { bytesDone: bytes, speedBps: Math.max(0, Math.round(speed)), etaSecs: speed > 0 ? Math.ceil(left / speed) : null });
     });
     session.on("fileComplete", (c) => {
-      const t = transfers.get(c.transferId);
-      if (!t) return;
+      const t = trackedFor(session, c.direction, c.transferId);
+      if (!t || isFinal(t.summary.state)) return;
       const f = t.files.find((x) => x.id === c.fileId);
       if (f) {
         f.state = c.ok ? "done" : "failed";
@@ -610,23 +715,25 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       emit({ type: "transferFilesUpdated", id: t.summary.id, files: t.files.map((x) => ({ ...x })) });
     });
     session.on("done", (d) => {
-      const t = transfers.get(d.transferId);
+      const t = trackedFor(session, d.direction, d.transferId);
       if (!t) return;
       const state: TransferState = d.failed.length ? (d.completed.length ? "completedWithErrors" : "failed") : "completed";
-      forgetResume(t.key, t.summary.id);
+      if (t.summary.direction === "receive") void forgetResume(t.key, t.wireId);
       finish(t, state, d.failed.length ? fail("files_failed", `${d.failed.length} file(s) didn't arrive intact.`) : null);
     });
     session.on("cancelled", (c) => {
-      const request = [...pending.values()].find((p) => p.offer.transferId === c.transferId && p.session === session);
-      if (request) {
-        pending.delete(request.request.id);
-        emit({ type: "incomingRequestClosed", id: request.request.id, reason: c.reason ?? "cancelled" });
+      if (c.direction === "receive") {
+        const request = [...pending.values()].find((p) => p.offer.transferId === c.transferId && p.session === session);
+        if (request) {
+          pending.delete(request.request.id);
+          emit({ type: "incomingRequestClosed", id: request.request.id, reason: c.reason ?? "cancelled" });
+        }
       }
-      const t = transfers.get(c.transferId);
-      if (!t || isFinal(t.summary.state) || t.session !== session) return;
+      const t = trackedFor(session, c.direction, c.transferId);
+      if (!t || isFinal(t.summary.state)) return;
       if (c.interrupted && !t.userCancelled) interrupted(t);
       else {
-        forgetResume(t.key, t.summary.id);
+        if (t.summary.direction === "receive") void forgetResume(t.key, t.wireId);
         finish(t, "cancelled", c.byRemote ? fail("cancelled_by_peer", `${t.summary.peer.alias} cancelled.`) : null);
       }
     });
@@ -656,12 +763,17 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
 
   // ── Transfers ───────────────────────────────────────────────────────────
 
-  const webrtc: ConnectionInfo = { transport: "webrtc", encrypted: true, ipVersion: null, relayed: false, address: null };
+  /** Relayed is only known once the browser reports the selected candidate pair. */
+  const webrtc: ConnectionInfo = { transport: "webrtc", encrypted: true, ipVersion: null, relayed: null, address: null };
 
-  function track(direction: Direction, peer: PeerRef, files: readonly FileMeta[], text: string | null, dropId: string | null, id: string, session: PeerSession | null, key: string): Tracked {
+  function wireKey(key: string, direction: Direction, wireId: string) {
+    return `${key}\n${direction}\n${wireId}`;
+  }
+
+  function track(direction: Direction, peer: PeerRef, files: readonly FileMeta[], text: string | null, dropId: string | null, wireId: string, session: PeerSession | null, key: string): Tracked {
     const first = files[0];
     const summaryValue: TransferSummary = {
-      id,
+      id: randomId(),
       direction,
       dropId,
       peer,
@@ -674,8 +786,11 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       etaSecs: null,
       startedAtMs: now(),
       finishedAtMs: null,
-      connection: webrtc,
+      connection: { ...webrtc },
       resumable: true,
+      // Browser transfers continue after a lost connection, but can't be paused.
+      canPause: false,
+      canResume: false,
       title: first ? (files.length > 1 ? `${first.name.split("/")[0]} and ${files.length - 1} more` : first.name) : "Message",
       text,
       error: null,
@@ -683,15 +798,61 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
     };
     const t: Tracked = {
       summary: summaryValue,
+      wireId,
       files: files.map((f) => ({ id: f.id, name: f.name, size: f.size, mime: f.mime, state: "pending", bytesDone: 0 })),
       session,
       done: new Map(),
       samples: [{ at: now(), bytes: 0 }],
       key,
     };
-    transfers.set(id, t);
+    // An older transfer with the same peer, direction and wire id gives way.
+    const older = byWire.get(wireKey(key, direction, wireId));
+    if (older) {
+      if (!isFinal(older.summary.state)) {
+        older.session = null;
+        finish(older, "failed", fail("superseded", `${peer.alias} started this transfer again.`));
+      }
+      remove(older);
+    }
+    transfers.set(summaryValue.id, t);
+    byWire.set(wireKey(key, direction, wireId), t);
     emit({ type: "transferUpdated", transfer: { ...summaryValue } });
+    if (session) void routeOf(t, session);
     return t;
+  }
+
+  function remove(t: Tracked) {
+    if (t.giveUp) clearTimeout(t.giveUp);
+    transfers.delete(t.summary.id);
+    const k = wireKey(t.key, t.summary.direction, t.wireId);
+    if (byWire.get(k) === t) byWire.delete(k);
+    emit({ type: "transferRemoved", id: t.summary.id });
+  }
+
+  /** Keeps at most MAX_FINISHED finished transfers in memory: the oldest are dismissed. */
+  function retain() {
+    const finished = [...transfers.values()].filter((t) => isFinal(t.summary.state));
+    if (finished.length <= MAX_FINISHED) return;
+    finished.sort((a, b) => (a.summary.finishedAtMs ?? 0) - (b.summary.finishedAtMs ?? 0));
+    for (const t of finished.slice(0, finished.length - MAX_FINISHED)) remove(t);
+  }
+
+  /** Reads whether `session` runs through a TURN relay and shows it on `t`. */
+  async function routeOf(t: Tracked, session: PeerSession) {
+    let route = routes.get(session);
+    if (!route) {
+      route = session.ready.then(() => relayedOf(connections.get(session))).catch(() => null);
+      routes.set(session, route);
+    }
+    const relayed = await route;
+    if (t.session !== session || t.summary.connection?.relayed === relayed) return;
+    update(t, { connection: { ...webrtc, relayed } });
+  }
+
+  /** Points `t` at `session`: events from any earlier session no longer touch it. */
+  function attach(t: Tracked, session: PeerSession) {
+    t.session = session;
+    void routeOf(t, session);
   }
 
   function update(t: Tracked, patch: Partial<TransferSummary>) {
@@ -706,10 +867,15 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
     const bytes = state === "completed" ? t.summary.totalBytes : t.summary.bytesDone;
     update(t, { state, error, finishedAtMs: now(), speedBps: 0, etaSecs: null, bytesDone: bytes });
     if (t.summary.direction === "send" && settings.historyEnabled) {
+      const entries: Omit<HistoryEntry, "id" | "timestampMs">[] = [];
+      const recorded = (t.recorded ??= new Set());
       for (const f of t.files) {
         if (f.state !== "done" && state !== "completed") continue;
-        void addHistory({
-          transferId: t.summary.id,
+        // Recorded when an earlier attempt ended; "Try again" finished the rest.
+        if (recorded.has(f.id)) continue;
+        recorded.add(f.id);
+        entries.push({
+          transferId: t.wireId,
           direction: "send",
           peerId: t.summary.peer.id,
           peerAlias: t.summary.peer.alias,
@@ -724,41 +890,130 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
           verified: true,
         });
       }
+      void (async () => {
+        for (const e of entries) await addEntry(e, { activity: true });
+      })().catch((err) => storageNotice("history", err));
     }
+    retain();
   }
 
-  function onCommitted(file: FileMeta, context: SinkContext, path: string) {
+  function storageNotice(what: "history" | "inbox" | "cleanup", err: unknown) {
+    const reason = (err as { name?: string } | null)?.name === "QuotaExceededError" ? "this browser is out of storage space" : String((err as Error)?.message ?? err);
+    const message =
+      what === "history"
+        ? `Couldn't save to history: ${reason}.`
+        : what === "inbox"
+          ? `A received file couldn't be added to the Inbox: ${reason}. Ask the sender to send it again.`
+          : `Couldn't clean up unused received files: ${reason}. Ferry tries again next time it opens.`;
+    emit({ type: "notice", level: what === "cleanup" ? "warning" : "error", code: `storage_${what}`, message });
+  }
+
+  /** A received file was verified and written. Throws when it can't be listed (the sink then drops it). */
+  async function onCommitted(file: FileMeta, context: SinkContext, path: string): Promise<void> {
     // A resumed transfer re-commits files that were already complete.
-    if (historyCache.some((h) => h.path === path)) return;
+    if (await historyDb.getBy("path", path)) return;
     const peer = peerRef(context.peerKey);
+    try {
+      await addEntry(
+        {
+          transferId: context.transferId,
+          direction: "receive",
+          peerId: context.peerKey,
+          peerAlias: peer.alias,
+          peerKind: peer.deviceKind,
+          kind: "file",
+          name: file.name,
+          size: file.size,
+          mime: file.mime,
+          path,
+          text: null,
+          status: "completed",
+          verified: true,
+        },
+        // The Inbox is the only way back to a file received in the browser, so it is always listed.
+        { inbox: true, activity: settings.historyEnabled },
+      );
+    } catch (err) {
+      storageNotice("inbox", err);
+      throw err;
+    }
     if (file.mime.startsWith("image/")) void cachePreview(path, file.name, file.mime);
-    void addHistory({
-      transferId: context.transferId,
-      direction: "receive",
-      peerId: context.peerKey,
-      peerAlias: peer.alias,
-      peerKind: peer.deviceKind,
-      kind: "file",
-      name: file.name,
-      size: file.size,
-      mime: file.mime,
-      path,
-      text: null,
-      status: "completed",
-      verified: true,
-    });
   }
 
-  async function addHistory(entry: Omit<HistoryEntry, "id" | "timestampMs">) {
-    // Received files are always listed: the Inbox is the only way back to them.
-    if (!settings.historyEnabled && entry.direction === "send") return;
-    const full: HistoryEntry = { ...entry, id: now() * 100 + (historySeq++ % 100), timestampMs: now() };
-    historyCache.unshift(full);
-    await historyDb.put(full);
-    emit({ type: "historyAdded", entry: full });
+  /** Stores an entry (ids come from the database, so tabs and bursts never collide) and tells the UI. */
+  async function addEntry(entry: Omit<HistoryEntry, "id" | "timestampMs">, flags: { inbox?: boolean; activity?: boolean }): Promise<HistoryEntry | null> {
+    const inbox = !!flags.inbox;
+    const activity = !!flags.activity;
+    if (!inbox && !activity) return null;
+    const value = { ...entry, timestampMs: now(), inbox, activity } as Omit<StoredEntry, "id">;
+    const id = (await historyDb.put(value as StoredEntry)) as number;
+    const stored: StoredEntry = { ...value, id };
+    const full = plain(stored);
+    if (activity) emit({ type: "historyAdded", entry: full });
+    if (inInbox(stored)) emit({ type: "inboxAdded", entry: full });
+    return full;
   }
 
-  function onOffer(session: PeerSession, offer: IncomingOffer) {
+  /** Admits a message from `key` unless it (or everyone together) sent too many lately. */
+  function admitMessage(key: string): boolean {
+    const at = now();
+    let total = 0;
+    for (const [k, times] of messageTimes) {
+      const recent = times.filter((t) => at - t < MESSAGE_WINDOW_MS);
+      if (recent.length) messageTimes.set(k, recent);
+      else messageTimes.delete(k);
+      total += recent.length;
+    }
+    const mine = messageTimes.get(key) ?? [];
+    if (mine.length >= MAX_MESSAGES_PER_PEER || total >= MAX_MESSAGES) return false;
+    messageTimes.set(key, [...mine, at]);
+    return true;
+  }
+
+  /**
+   * Shows a message once per (peer, transfer) and records it as the settings
+   * allow: nothing without history, only that it arrived without message text.
+   */
+  function deliverMessage(key: string, peer: PeerRef, trusted: boolean, wireId: string, text: string) {
+    const id = `${key} ${wireId}`;
+    if (delivered.has(id)) return;
+    delivered.add(id);
+    if (delivered.size > MAX_DELIVERED) delivered.delete(delivered.values().next().value!);
+    const request: IncomingRequest = {
+      id: randomId(),
+      peer,
+      files: [],
+      totalBytes: 0,
+      text,
+      receivedAtMs: now(),
+      trusted,
+      defaultSaveDir: "",
+      expiresAtMs: now(),
+    };
+    emit({ type: "incomingRequest", request });
+    if (!settings.historyEnabled) return;
+    const keep = settings.keepMessageText;
+    void addEntry(
+      {
+        transferId: wireId,
+        direction: "receive",
+        peerId: key,
+        peerAlias: peer.alias,
+        peerKind: peer.deviceKind,
+        kind: "text",
+        name: keep ? firstLine(text) : "Message",
+        size: new TextEncoder().encode(text).length,
+        mime: "text/plain",
+        path: null,
+        text: keep ? text : null,
+        status: "completed",
+        verified: true,
+      },
+      { activity: true },
+    ).catch((err) => storageNotice("history", err));
+  }
+
+  async function onOffer(session: PeerSession, offer: IncomingOffer) {
     const key = offer.peer.key;
     if (!settings.receiveEnabled) return offer.decline();
     const peer = peerRef(key, offer.peer);
@@ -766,40 +1021,14 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
 
     // A message: shown right away, nothing to accept (LocalSend semantics).
     if (!offer.files.length) {
+      const repeat = delivered.has(`${key} ${offer.transferId}`);
+      if (!repeat && !admitMessage(key)) return offer.decline();
       try {
         offer.accept([]);
       } catch {
-        /* the sender cancelled meanwhile */
+        return; // the sender cancelled meanwhile
       }
-      const request: IncomingRequest = {
-        id: offer.transferId,
-        peer,
-        files: [],
-        totalBytes: 0,
-        text: offer.text ?? "",
-        receivedAtMs: now(),
-        trusted,
-        defaultSaveDir: "",
-        expiresAtMs: now(),
-      };
-      emit({ type: "incomingRequest", request });
-      if (settings.keepMessageText) {
-        void addHistory({
-          transferId: offer.transferId,
-          direction: "receive",
-          peerId: key,
-          peerAlias: peer.alias,
-          peerKind: peer.deviceKind,
-          kind: "text",
-          name: "Message",
-          size: (offer.text ?? "").length,
-          mime: "text/plain",
-          path: null,
-          text: offer.text ?? "",
-          status: "completed",
-          verified: true,
-        });
-      }
+      deliverMessage(key, peer, trusted, offer.transferId, offer.text ?? "");
       return;
     }
 
@@ -808,7 +1037,8 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       record &&
       Object.entries(record.files).every(([id, m]) => offer.files.some((f) => f.id === id && f.size === m.size && f.name === m.name && f.mime === m.mime));
     if (record && matches) {
-      void resumeAccept(session, offer, record);
+      // Its text (if any) was shown when it was first accepted.
+      await resumeAccept(session, offer, record);
       return;
     }
 
@@ -827,6 +1057,7 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       peer,
       files: offer.files.map((f) => ({ id: f.id, name: f.name, size: f.size, mime: f.mime })),
       totalBytes: offer.files.reduce((n, f) => n + f.size, 0),
+      // Text that comes with files is shown once the files are accepted (see `respond`).
       text: null,
       receivedAtMs: now(),
       trusted,
@@ -845,33 +1076,45 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
     const p = pending.get(requestId);
     if (!p) return false;
     pending.delete(requestId);
-    emit({ type: "incomingRequestClosed", id: requestId, reason: decision.decline ? "declined" : "accepted" });
-    if (decision.decline) {
-      p.offer.decline();
+    // Accepting none of the files is a decline, as on the desktop: the text that
+    // came with them is not shown either.
+    const declined = decision.decline || (decision.accept != null && !p.offer.files.some((f) => decision.accept!.includes(f.id)));
+    emit({ type: "incomingRequestClosed", id: requestId, reason: declined ? "declined" : "accepted" });
+    if (declined) {
+      try {
+        p.offer.decline();
+      } catch {
+        /* the sender cancelled meanwhile */
+      }
       return true;
     }
+    const key = p.offer.peer.key;
+    const wireId = p.offer.transferId;
     const ids = decision.accept ?? p.offer.files.map((f) => f.id);
     const files = p.offer.files.filter((f) => ids.includes(f.id));
-    const t = track("receive", p.request.peer, files, null, null, p.offer.transferId, p.session, p.offer.peer.key);
-    t.files.forEach((f) => (f.state = "transferring"));
-    t.samples = [{ at: now(), bytes: 0 }];
-    update(t, { state: "transferring", saveDir: null });
-    if (decision.trust) await remember(p.offer.peer.key, { trusted: true });
+    if (decision.trust) await remember(key, { trusted: true });
     const nonce = randomId();
-    nonces.set(`${p.offer.peer.key} ${p.offer.transferId}`, nonce);
+    nonces.set(`${key} ${wireId}`, nonce);
     await rememberResume({
-      key: p.offer.peer.key,
-      transferId: p.offer.transferId,
+      key,
+      transferId: wireId,
       files: Object.fromEntries(files.map((f) => [f.id, { name: f.name, size: f.size, mime: f.mime }])),
       nonce,
       at: now(),
-    });
+    }).catch((err) => storageNotice("inbox", err));
+    const t = track("receive", p.request.peer, files, null, null, wireId, p.session, key);
+    t.files.forEach((f) => (f.state = "transferring"));
+    t.samples = [{ at: now(), bytes: 0 }];
+    update(t, { state: "transferring", saveDir: null });
     try {
       p.offer.accept(ids);
     } catch (err) {
+      void forgetResume(key, wireId);
       finish(t, "failed", fail("accept_failed", err instanceof Error ? err.message : String(err)));
       return false;
     }
+    // Accepted, even in part: the message that came with the files arrives too.
+    if (p.offer.text !== undefined) deliverMessage(key, p.request.peer, p.request.trusted, wireId, p.offer.text);
     return true;
   }
 
@@ -891,11 +1134,11 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
 
     return targets.map((target) => {
       const key = target.id;
-      const transferId = randomId();
-      const t = track("send", peerRef(key), files, text ?? null, dropId, transferId, null, key);
-      t.request = { transferId, files, text };
+      const wireId = randomId();
+      const t = track("send", peerRef(key), files, text ?? null, dropId, wireId, null, key);
+      t.request = { transferId: wireId, files, text };
       void runSend(t, false);
-      return transferId;
+      return t.summary.id;
     });
   }
 
@@ -905,9 +1148,10 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
     try {
       const session = fresh ? await freshSession(t.key) : await sessionFor(t.key);
       if (isFinal(t.summary.state) || t.userCancelled) return;
-      t.session = session;
+      attach(t, session);
       update(t, { state: t.summary.bytesDone > 0 ? "transferring" : "waitingForAcceptance", error: null });
       const outcome = await session.sendTransfer(request);
+      if (t.session !== session) return;
       if (outcome.declined) return finish(t, "declined", fail("declined", `${t.summary.peer.alias} declined.`));
       if (outcome.failed.length) {
         return finish(t, outcome.completed.length ? "completedWithErrors" : "failed", fail("files_failed", `${outcome.failed.length} file(s) failed.`));
@@ -952,12 +1196,13 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
   }
 
   async function retrySend(t: Tracked) {
-    for (const delay of RETRY_DELAYS_MS) {
+    const delays = options.retryDelaysMs ?? RETRY_DELAYS_MS;
+    for (const delay of delays) {
       await sleep(delay);
       if (isFinal(t.summary.state) || t.userCancelled) return;
       if (!present.has(t.key)) continue;
       t.attempts = (t.attempts ?? 0) + 1;
-      if (t.attempts > RETRY_DELAYS_MS.length) break;
+      if (t.attempts > delays.length) break;
       t.retrying = false;
       return runSend(t, true);
     }
@@ -967,20 +1212,45 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
 
   // ── Resume records (receiver) ───────────────────────────────────────────
 
-  async function rememberResume(record: ResumeRecord) {
-    resumeRecords = [record, ...resumeRecords.filter((r) => !(r.key === record.key && r.transferId === record.transferId))].slice(0, 50);
-    await kv.put(resumeRecords, "resume");
+  function liveRecords(list: unknown): ResumeRecord[] {
+    return (Array.isArray(list) ? (list as ResumeRecord[]) : []).filter((r) => r && now() - r.at < RESUME_TTL_MS && r.nonce && r.files);
   }
 
-  function forgetResume(key: string, transferId: string) {
-    const before = resumeRecords.length;
+  /** Read, change and write the shared list in one transaction, so tabs don't overwrite each other's records. */
+  async function changeResume(fn: (list: ResumeRecord[]) => ResumeRecord[]) {
+    const next = await kv.update("resume", (list) => fn(liveRecords(list)).slice(0, 50));
+    resumeRecords = liveRecords(next);
+  }
+
+  async function rememberResume(record: ResumeRecord) {
+    resumeRecords = [record, ...resumeRecords.filter((r) => !(r.key === record.key && r.transferId === record.transferId))];
+    await changeResume((list) => [record, ...list.filter((r) => !(r.key === record.key && r.transferId === record.transferId))]);
+  }
+
+  async function forgetResume(key: string, transferId: string) {
+    nonces.delete(`${key} ${transferId}`);
     resumeRecords = resumeRecords.filter((r) => !(r.key === key && r.transferId === transferId));
-    if (resumeRecords.length !== before) void kv.put(resumeRecords, "resume");
+    await changeResume((list) => list.filter((r) => !(r.key === key && r.transferId === transferId))).catch(() => {});
   }
 
   /** A transfer we already accepted comes back after an interruption: continue without asking again. */
   async function resumeAccept(session: PeerSession, offer: IncomingOffer, record: ResumeRecord) {
     const ids = Object.keys(record.files);
+    const wk = wireKey(record.key, "receive", offer.transferId);
+    let t = byWire.get(wk);
+    if (t && isFinal(t.summary.state)) t = undefined;
+    // Take it over from an older session first, so nothing that one still reports touches it.
+    const stale = t?.session && t.session !== session ? t.session : null;
+    if (t) {
+      if (t.giveUp) clearTimeout(t.giveUp);
+      t.giveUp = undefined;
+      attach(t, session);
+    }
+    if (stale && stale.state !== "closed") {
+      // The sender moved to a new connection: end the old one (its partial file is kept) and let it settle.
+      stale.close("resumed on a new connection");
+      await sleep(100);
+    }
     const context = { transferId: offer.transferId, peerKey: record.key };
     nonces.set(`${record.key} ${offer.transferId}`, record.nonce);
     const offsets: Record<string, number> = {};
@@ -988,20 +1258,19 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       const size = await storedSize(context, id, record.nonce).catch(() => 0);
       if (size > 0) offsets[id] = Math.min(size, record.files[id]!.size);
     }
-    let t = transfers.get(offer.transferId);
-    if (t && t.summary.direction === "receive" && !isFinal(t.summary.state)) {
-      if (t.giveUp) clearTimeout(t.giveUp);
-      t.session = session;
-    } else {
+    // Another offer for it may have taken over while the sizes were read.
+    if (t && t.session !== session) return;
+    if (!t) {
       const files = offer.files.filter((f) => ids.includes(f.id));
       t = track("receive", peerRef(record.key, offer.peer), files, null, null, offer.transferId, session, record.key);
     }
+    t.done.clear();
     for (const [id, offset] of Object.entries(offsets)) t.done.set(id, offset);
     const resumed = Object.values(offsets).reduce((a, b) => a + b, 0);
     t.files.forEach((f) => (f.state = "transferring"));
     t.samples = [{ at: now(), bytes: resumed }];
-    update(t, { state: "transferring", bytesDone: resumed, error: null });
-    await rememberResume({ ...record, at: now() });
+    update(t, { state: "transferring", bytesDone: resumed, error: null, finishedAtMs: null });
+    await rememberResume({ ...record, at: now() }).catch(() => {});
     try {
       offer.accept(ids, offsets);
     } catch {
@@ -1018,8 +1287,8 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
 
   // ── Stored files ────────────────────────────────────────────────────────
 
-  function entryFor(path: string) {
-    return historyCache.find((h) => h.path === path);
+  function entryFor(path: string): Promise<StoredEntry | undefined> {
+    return historyDb.getBy("path", path);
   }
 
   async function cachePreview(path: string, name: string, mime: string) {
@@ -1031,9 +1300,41 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
     }
   }
 
+  function dropPreview(path: string) {
+    const url = previews.get(path);
+    if (url) URL.revokeObjectURL(url);
+    previews.delete(path);
+  }
+
   async function fileAt(path: string): Promise<File> {
-    const h = entryFor(path);
+    const h = await entryFor(path);
     return readStored(path, h?.name.split("/").pop() ?? "file", h?.mime ?? "");
+  }
+
+  /** Every stored entry `filter` accepts, oldest first, read a page at a time. */
+  async function scan(filter: (e: StoredEntry) => boolean, fn: (e: StoredEntry) => void | Promise<void>) {
+    let after: number | undefined;
+    for (;;) {
+      const page = await historyDb.page({ limit: PAGE, after });
+      for (const e of page) if (filter(e)) await fn(e);
+      if (page.length < PAGE) return;
+      after = page.at(-1)!.id;
+    }
+  }
+
+  /** Deletes partial files of transfers that can no longer resume, and files nothing lists. */
+  async function cleanUp() {
+    // Read fresh: another tab may have received files or accepted transfers since this one started.
+    const keep = new Set<string>();
+    await scan(isInboxFile, (e) => {
+      const id = e.path ? idOfPath(e.path) : null;
+      if (id) keep.add(id);
+    });
+    for (const r of liveRecords(await kv.get("resume"))) {
+      for (const id of Object.keys(r.files)) keep.add(await storageId({ peerKey: r.key, transferId: r.transferId }, id, r.nonce));
+    }
+    const result = await pruneStored(keep, { graceMs: PRUNE_GRACE_MS });
+    if (result.failed) storageNotice("cleanup", new Error(`${result.failed} file(s) couldn't be deleted`));
   }
 
   // ── Shared into the PWA (Web Share Target, handled by the service worker) ─
@@ -1090,17 +1391,13 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       shortId = await shortIdOf(publicKey);
       settings = { ...defaultSettings(), ...((await kv.get("settings")) as Partial<Settings> | undefined) };
       for (const d of await knownDb.all()) known.set(d.id, d);
-      historyCache = (await historyDb.all()).sort((a, b) => b.id - a.id);
-      resumeRecords = (((await kv.get("resume")) as ResumeRecord[] | undefined) ?? []).filter((r) => now() - r.at < RESUME_TTL_MS && r.nonce && r.files);
-      void (async () => {
-        // Partial files of transfers that can no longer resume are unreachable: delete them.
-        const keep = new Set(historyCache.map((h) => (h.path ? idOfPath(h.path) : null)).filter((x): x is string => !!x));
-        for (const r of resumeRecords) {
-          for (const id of Object.keys(r.files)) keep.add(await storageId({ peerKey: r.key, transferId: r.transferId }, id, r.nonce));
-        }
-        await pruneStored(keep);
-      })().catch(() => {});
-      for (const h of historyCache.slice(0, 40)) if (h.path && h.mime.startsWith("image/")) void cachePreview(h.path, h.name, h.mime);
+      resumeRecords = liveRecords(await kv.get("resume"));
+      // Partial files of transfers that can no longer resume are unreachable: delete them.
+      void cleanUp().catch((err) => storageNotice("cleanup", err));
+      void historyDb
+        .page({ limit: 40, reverse: true, filter: (e) => isInboxFile(e) && RASTER.test(e.mime) })
+        .then((recent) => recent.forEach((h) => void cachePreview(h.path!, h.name, h.mime)))
+        .catch(() => {});
       // Ask the browser not to evict received files under storage pressure.
       void navigator.storage?.persist?.().catch(() => false);
       startSignaling();
@@ -1138,22 +1435,26 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       const t = transfers.get(id);
       if (!t || isFinal(t.summary.state)) return false;
       t.userCancelled = true;
-      t.session?.cancel("cancelled", id);
-      forgetResume(t.key, id);
+      t.session?.cancel("cancelled", t.wireId);
+      if (t.summary.direction === "receive") void forgetResume(t.key, t.wireId);
       finish(t, "cancelled", null);
       return true;
     },
+    /** Browser transfers can't be paused (`canPause` is false). */
     async pause() {
       return false;
     },
-    /** "Try again" for a sent transfer that lost its connection: continues where it stopped. */
+    /**
+     * "Try again" for a send that failed because its connection was lost:
+     * offers it again and the receiver continues where it stopped. Ignored
+     * while a retry is already under way (the state is no longer "failed").
+     */
     async resume(id) {
       const t = transfers.get(id);
-      if (!t?.request || t.summary.direction !== "send" || !["failed", "reconnecting"].includes(t.summary.state)) return false;
+      if (!t?.request || t.userCancelled || t.summary.direction !== "send" || t.summary.state !== "failed" || t.summary.error?.code !== "connection_lost") return false;
       t.attempts = 0;
       t.retrying = false;
-      Object.assign(t.summary, { state: "reconnecting", finishedAtMs: null, error: null });
-      update(t, {});
+      update(t, { state: "reconnecting", finishedAtMs: null, error: fail("connection_lost", "Reconnecting…", "It continues where it stopped.") });
       void runSend(t, true);
       return true;
     },
@@ -1163,8 +1464,7 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
     async dismiss(id) {
       const t = transfers.get(id);
       if (!t || !isFinal(t.summary.state)) return false;
-      transfers.delete(id);
-      emit({ type: "transferRemoved", id });
+      remove(t);
       return true;
     },
     async transferFiles(id) {
@@ -1213,29 +1513,64 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       throw unsupported("Pairing");
     },
 
+    /** The History page: newest first, paged by id (stable while entries arrive from this or another tab). */
     async history(limit, beforeId, direction) {
-      return historyCache.filter((h) => (beforeId == null || h.id < beforeId) && (!direction || h.direction === direction)).slice(0, limit);
+      const page = await historyDb.page({
+        limit,
+        after: beforeId ?? undefined,
+        reverse: true,
+        filter: (e) => isActivity(e) && (!direction || e.direction === direction),
+      });
+      return page.map(plain);
     },
+    /** The Inbox: received files (whatever the history settings) and the messages history kept. */
+    async inbox(limit: number, beforeId?: number) {
+      const page = await historyDb.page({ limit, after: beforeId ?? undefined, reverse: true, filter: inInbox });
+      return page.map(plain);
+    },
+    /** Removes one entry; a file received in this browser is deleted with it (nothing else could reach it). */
     async deleteHistory(id) {
-      const h = historyCache.find((x) => x.id === id);
+      const h = await historyDb.get(id);
       if (!h) return false;
-      historyCache = historyCache.filter((x) => x.id !== id);
-      await historyDb.delete(id);
-      // The browser copy is only reachable through this entry.
-      if (h.path) {
-        await deleteStored(h.path).catch(() => {});
-        const url = previews.get(h.path);
-        if (url) URL.revokeObjectURL(url);
-        previews.delete(h.path);
+      if (h.path && isInboxFile(h)) {
+        try {
+          await deleteStored(h.path);
+        } catch (err) {
+          throw fail("delete_failed", `Couldn't delete "${h.name}" from this browser.`, `Try again. (${err instanceof Error ? err.message : String(err)})`);
+        }
+        dropPreview(h.path);
       }
+      await historyDb.delete(id);
       return true;
     },
+    /**
+     * Clears the activity history (sent items, messages, the record of what
+     * arrived). Received files stay in the Inbox: their entries lose only
+     * their place in History. One transaction: all or nothing.
+     */
     async clearHistory() {
-      for (const h of historyCache) if (h.path) await deleteStored(h.path).catch(() => {});
-      previews.forEach((url) => URL.revokeObjectURL(url));
-      previews.clear();
-      historyCache = [];
-      await historyDb.clear();
+      await historyDb.rewrite((e) => (isInboxFile(e) ? { ...e, inbox: true, activity: false } : null));
+    },
+    /** Deletes every file received in this browser. History entries stay, without the file. */
+    async clearReceivedFiles() {
+      const files: StoredEntry[] = [];
+      await scan(isInboxFile, (e) => void files.push(e));
+      let deleted = 0;
+      let failed = 0;
+      for (const e of files) {
+        try {
+          if (e.path) {
+            await deleteStored(e.path);
+            dropPreview(e.path);
+          }
+          if (isActivity(e)) await historyDb.put({ ...e, inbox: false, path: null });
+          else await historyDb.delete(e.id);
+          deleted++;
+        } catch {
+          failed++;
+        }
+      }
+      return { deleted, failed };
     },
 
     async updateSettings(next) {
@@ -1243,8 +1578,9 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       if (!alias) throw fail("invalid_settings", "The device name can't be empty.");
       const previous = settings;
       // A plain copy: the UI hands in reactive proxies, which IndexedDB can't clone.
-      settings = JSON.parse(JSON.stringify({ ...next, alias, signalingUrl: next.signalingUrl?.trim() || null })) as Settings;
-      await kv.put(settings, "settings");
+      const saved = JSON.parse(JSON.stringify({ ...next, alias, signalingUrl: next.signalingUrl?.trim() || null })) as Settings;
+      await kv.put(saved, "settings");
+      settings = saved;
       if (previous.signalingUrl !== settings.signalingUrl || previous.stunServers.join() !== settings.stunServers.join()) startSignaling();
       else if (previous.alias !== settings.alias) signaling?.update({ alias: settings.alias });
       emit({ type: "localDeviceChanged", device: local() });
@@ -1379,8 +1715,7 @@ export function createWebPlatform(): Platform & { takeShared(): Promise<Outgoing
       return [...rooms.values()].map(roomInfo);
     },
     async signalingStatus(): Promise<SignalingStatus> {
-      const status = serverStatus();
-      return { url: signalingUrl(settings), state: signalingState, error: status.error, identityKey: publicKey };
+      return currentSignaling();
     },
   };
 }

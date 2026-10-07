@@ -4,11 +4,17 @@ description = "Ferry desktop app (Tauri shell around ferry-core)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 publish = false
 
 [lib]
 name = "ferry_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+# Tests live in tests/: Windows only starts test binaries that embed the app
+# manifest (build.rs), and a library's own test binary can't get it.
+test = false
+doctest = false
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -26,6 +32,11 @@ tokio = { version = "1.53", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+
+[dev-dependencies]
+# `test`: a mock app, to check previews against Tauri's real asset scope.
+tauri = { version = "2", features = ["test"] }
+tempfile = "3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"

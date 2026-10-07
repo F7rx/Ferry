@@ -30,6 +30,7 @@ describe("public surface", () => {
         "parseMaxMessageSize",
         "randomBytes",
         "randomId",
+        "relayedOf",
         "roomIdFromSecret",
         "serializeForIdb",
       ].sort(),

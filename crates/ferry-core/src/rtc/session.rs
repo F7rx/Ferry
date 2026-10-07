@@ -938,11 +938,9 @@ impl Inner {
                 return Ok(());
             }
             Control::Pong => return Ok(()),
-            Control::Cancel { transfer_id, reason } => {
-                if self.on_remote_cancel(transfer_id, reason.as_deref()) {
-                    return Ok(());
-                }
-            }
+            // Handled here when it names the current transfer; otherwise it
+            // falls through and is queued for the worker.
+            Control::Cancel { transfer_id, reason } if self.on_remote_cancel(transfer_id, reason.as_deref()) => return Ok(()),
             Control::Answer(a) => return self.on_answer(a),
             Control::FileAck { id, ok, sha256, error } => return self.on_file_ack(id, *ok, sha256.clone(), error.clone()),
             Control::Progress { transfer_id, bytes } => return self.on_progress(transfer_id, *bytes),

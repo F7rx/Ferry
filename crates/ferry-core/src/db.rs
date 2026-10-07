@@ -7,7 +7,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: i64 = 1;
+/// Schema steps; `PRAGMA user_version` counts how many have been applied.
+const MIGRATIONS: [&str; 2] = [SCHEMA_V1, SCHEMA_V2];
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS devices (
@@ -71,6 +72,30 @@ CREATE TABLE IF NOT EXISTS inbound_files (
 );
 "#;
 
+/// Version 2: what a resumable transfer was approved with, so a restored
+/// session keeps the same constraints. Rows from version 1 keep `manifest = 0`
+/// (checksums and declined files unknown) and a NULL `save_root`.
+const SCHEMA_V2: &str = r#"
+ALTER TABLE inbound_transfers ADD COLUMN save_root TEXT;
+ALTER TABLE inbound_transfers ADD COLUMN display_root TEXT;
+ALTER TABLE inbound_transfers ADD COLUMN manifest INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE inbound_files ADD COLUMN sha256 TEXT;
+ALTER TABLE inbound_files ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS inbound_declined (
+    peer_fingerprint TEXT NOT NULL,
+    transfer_id      TEXT NOT NULL,
+    file_id          TEXT NOT NULL,
+    rel_name         TEXT NOT NULL,
+    size             INTEGER NOT NULL,
+    mime             TEXT NOT NULL,
+    sha256           TEXT,
+    PRIMARY KEY (peer_fingerprint, transfer_id, file_id),
+    FOREIGN KEY (peer_fingerprint, transfer_id)
+        REFERENCES inbound_transfers(peer_fingerprint, transfer_id) ON DELETE CASCADE
+);
+"#;
+
 pub struct Db {
     conn: Mutex<Connection>,
 }
@@ -120,6 +145,20 @@ pub struct InboundFileRecord {
     pub final_path: Option<String>,
     pub offset: u64,
     pub done: bool,
+    /// The checksum announced when the transfer was approved.
+    pub sha256: Option<String>,
+    /// Uploads discarded so far (checksum mismatch, failed verification).
+    pub attempts: u32,
+}
+
+/// A file of the approved offer that the user did not accept.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InboundOfferedFile {
+    pub file_id: String,
+    pub rel_name: String,
+    pub size: u64,
+    pub mime: String,
+    pub sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,6 +169,14 @@ pub struct InboundRecord {
     pub created_ms: u64,
     pub updated_ms: u64,
     pub files: Vec<InboundFileRecord>,
+    /// The folder the user approved; partial files must stay inside it.
+    /// None for rows written before schema version 2.
+    pub save_root: Option<String>,
+    /// The folder shown for the transfer (the save root or its own subfolder).
+    pub display_root: Option<String>,
+    /// Whether checksums and declined files were recorded (schema version 2).
+    pub manifest: bool,
+    pub declined: Vec<InboundOfferedFile>,
 }
 
 fn enum_str<T: serde::Serialize>(value: &T) -> String {
@@ -156,11 +203,15 @@ impl Db {
     fn init(conn: Connection) -> Result<Db> {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 1 {
-            conn.execute_batch(SCHEMA_V1)?;
-        }
-        if version < SCHEMA_VERSION {
-            conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        // Each step runs in its own transaction with its version bump, so an
+        // interrupted upgrade is retried from where it stopped.
+        for (step, sql) in (1..).zip(MIGRATIONS) {
+            if version < step {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(sql)?;
+                tx.execute_batch(&format!("PRAGMA user_version = {step}"))?;
+                tx.commit()?;
+            }
         }
         Ok(Db { conn: Mutex::new(conn) })
     }
@@ -329,16 +380,31 @@ impl Db {
     pub fn save_inbound(&self, record: &InboundRecord) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        // Replaces the whole record: no file row of an earlier save survives.
         tx.execute(
-            "INSERT OR REPLACE INTO inbound_transfers (peer_fingerprint, transfer_id, peer_alias, created_ms, updated_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![record.peer_fingerprint, record.transfer_id, record.peer_alias, record.created_ms as i64, record.updated_ms as i64],
+            "DELETE FROM inbound_transfers WHERE peer_fingerprint = ?1 AND transfer_id = ?2",
+            params![record.peer_fingerprint, record.transfer_id],
+        )?;
+        tx.execute(
+            "INSERT INTO inbound_transfers
+                (peer_fingerprint, transfer_id, peer_alias, created_ms, updated_ms, save_root, display_root, manifest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.peer_fingerprint,
+                record.transfer_id,
+                record.peer_alias,
+                record.created_ms as i64,
+                record.updated_ms as i64,
+                record.save_root,
+                record.display_root,
+                record.manifest
+            ],
         )?;
         for f in &record.files {
             tx.execute(
-                "INSERT OR REPLACE INTO inbound_files
-                    (peer_fingerprint, transfer_id, file_id, rel_name, size, mime, part_path, final_path, offset, done)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO inbound_files
+                    (peer_fingerprint, transfer_id, file_id, rel_name, size, mime, part_path, final_path, offset, done, sha256, attempts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     record.peer_fingerprint,
                     record.transfer_id,
@@ -349,8 +415,17 @@ impl Db {
                     f.part_path,
                     f.final_path,
                     f.offset as i64,
-                    f.done
+                    f.done,
+                    f.sha256,
+                    f.attempts
                 ],
+            )?;
+        }
+        for f in &record.declined {
+            tx.execute(
+                "INSERT INTO inbound_declined (peer_fingerprint, transfer_id, file_id, rel_name, size, mime, sha256)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![record.peer_fingerprint, record.transfer_id, f.file_id, f.rel_name, f.size as i64, f.mime, f.sha256],
             )?;
         }
         tx.commit()?;
@@ -361,17 +436,26 @@ impl Db {
         let conn = self.conn.lock().unwrap();
         let head = conn
             .query_row(
-                "SELECT peer_alias, created_ms, updated_ms FROM inbound_transfers
+                "SELECT peer_alias, created_ms, updated_ms, save_root, display_root, manifest FROM inbound_transfers
                  WHERE peer_fingerprint = ?1 AND transfer_id = ?2",
                 params![peer_fingerprint, transfer_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, bool>(5)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((peer_alias, created_ms, updated_ms)) = head else {
+        let Some((peer_alias, created_ms, updated_ms, save_root, display_root, manifest)) = head else {
             return Ok(None);
         };
         let mut stmt = conn.prepare(
-            "SELECT file_id, rel_name, size, mime, part_path, final_path, offset, done FROM inbound_files
+            "SELECT file_id, rel_name, size, mime, part_path, final_path, offset, done, sha256, attempts FROM inbound_files
              WHERE peer_fingerprint = ?1 AND transfer_id = ?2",
         )?;
         let files = stmt
@@ -385,6 +469,23 @@ impl Db {
                     final_path: r.get(5)?,
                     offset: r.get::<_, i64>(6)? as u64,
                     done: r.get(7)?,
+                    sha256: r.get(8)?,
+                    attempts: r.get::<_, i64>(9)?.clamp(0, u32::MAX as i64) as u32,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut stmt = conn.prepare(
+            "SELECT file_id, rel_name, size, mime, sha256 FROM inbound_declined
+             WHERE peer_fingerprint = ?1 AND transfer_id = ?2",
+        )?;
+        let declined = stmt
+            .query_map(params![peer_fingerprint, transfer_id], |r| {
+                Ok(InboundOfferedFile {
+                    file_id: r.get(0)?,
+                    rel_name: r.get(1)?,
+                    size: r.get::<_, i64>(2)? as u64,
+                    mime: r.get(3)?,
+                    sha256: r.get(4)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -395,6 +496,10 @@ impl Db {
             created_ms: created_ms as u64,
             updated_ms: updated_ms as u64,
             files,
+            save_root,
+            display_root,
+            manifest,
+            declined,
         }))
     }
 
@@ -416,6 +521,17 @@ impl Db {
         conn.execute(
             "UPDATE inbound_transfers SET updated_ms = ?3 WHERE peer_fingerprint = ?1 AND transfer_id = ?2",
             params![peer_fingerprint, transfer_id, crate::util::now_ms() as i64],
+        )?;
+        Ok(())
+    }
+
+    /// A file's data was discarded (checksum mismatch, failed verification):
+    /// it starts over from zero, `attempts` uploads having been used up.
+    pub fn reset_inbound_file(&self, peer_fingerprint: &str, transfer_id: &str, file_id: &str, attempts: u32) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE inbound_files SET offset = 0, done = 0, final_path = NULL, attempts = ?4
+             WHERE peer_fingerprint = ?1 AND transfer_id = ?2 AND file_id = ?3",
+            params![peer_fingerprint, transfer_id, file_id, attempts],
         )?;
         Ok(())
     }
@@ -531,16 +647,74 @@ mod tests {
                 final_path: None,
                 offset: 0,
                 done: false,
+                sha256: Some("ab".repeat(32)),
+                attempts: 0,
+            }],
+            save_root: Some("/tmp".into()),
+            display_root: Some("/tmp".into()),
+            manifest: true,
+            declined: vec![InboundOfferedFile {
+                file_id: "f1".into(),
+                rel_name: "skipped.txt".into(),
+                size: 5,
+                mime: "text/plain".into(),
+                sha256: None,
             }],
         };
         db.save_inbound(&record).unwrap();
+        assert_eq!(db.load_inbound("FP", "T1").unwrap().unwrap(), record);
         db.update_inbound_file("FP", "T1", "f0", 64, false, None).unwrap();
         let loaded = db.load_inbound("FP", "T1").unwrap().unwrap();
         assert_eq!(loaded.files[0].offset, 64);
+        db.reset_inbound_file("FP", "T1", "f0", 2).unwrap();
+        let loaded = db.load_inbound("FP", "T1").unwrap().unwrap();
+        assert_eq!((loaded.files[0].offset, loaded.files[0].attempts), (0, 2));
+        assert_eq!(loaded.files[0].sha256, record.files[0].sha256, "the approved checksum survives a reset");
         assert!(db.load_inbound("OTHER", "T1").unwrap().is_none());
+
+        // Saving again replaces the record as a whole.
+        let mut fewer = record.clone();
+        fewer.declined.clear();
+        db.save_inbound(&fewer).unwrap();
+        assert!(db.load_inbound("FP", "T1").unwrap().unwrap().declined.is_empty());
 
         let parts = db.expire_inbound(u64::MAX).unwrap();
         assert_eq!(parts, vec!["/tmp/big.iso.ferrypart".to_string()]);
         assert!(db.load_inbound("FP", "T1").unwrap().is_none());
+    }
+
+    #[test]
+    fn version_1_database_is_upgraded_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ferry.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 1;
+                 INSERT INTO devices (fingerprint, alias, device_kind, trusted) VALUES ('AA', 'Laptop', 'desktop', 1);
+                 INSERT INTO inbound_transfers VALUES ('FP', 'T1', 'Laptop', 5, 6);
+                 INSERT INTO inbound_files VALUES ('FP', 'T1', 'f0', 'Album/big.iso', 100, 'application/x-iso9660-image',
+                                                   '/save/Album/big.iso.abc123.ferrypart', NULL, 42, 0);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let version: i64 = db.conn.lock().unwrap().query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        assert!(db.known_devices().unwrap()[0].trusted);
+        let record = db.load_inbound("FP", "T1").unwrap().unwrap();
+        assert_eq!((record.created_ms, record.updated_ms), (5, 6));
+        assert!(!record.manifest, "a legacy row must not look like it recorded checksums");
+        assert_eq!((record.save_root, record.display_root), (None, None));
+        assert!(record.declined.is_empty());
+        let f = &record.files[0];
+        assert_eq!((f.rel_name.as_str(), f.size, f.offset, f.done), ("Album/big.iso", 100, 42, false));
+        assert_eq!(f.part_path, "/save/Album/big.iso.abc123.ferrypart");
+        assert_eq!((f.sha256.clone(), f.attempts), (None, 0));
+        drop(db);
+        // Opening again is a no-op.
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.load_inbound("FP", "T1").unwrap().unwrap().files.len(), 1);
     }
 }

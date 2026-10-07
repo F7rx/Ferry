@@ -25,6 +25,18 @@ pub fn secret_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
+/// How a text message is recorded in history: its name and stored body. With
+/// *Remember message text* it is named after its first line (up to 80
+/// characters) and keeps its text; without, it is just "Message" and nothing
+/// of what it said is stored.
+pub fn message_history(text: &str, keep_text: bool) -> (String, Option<String>) {
+    if !keep_text {
+        return ("Message".to_string(), None);
+    }
+    let line: String = text.trim().lines().next().unwrap_or("").trim().chars().take(80).collect();
+    (if line.is_empty() { "Message".to_string() } else { line }, Some(text.to_string()))
+}
+
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
     if bytes < 1000 {
@@ -52,6 +64,14 @@ pub fn mime_for(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_history_keeps_text_only_when_asked() {
+        assert_eq!(message_history("secret plans\nmore", false), ("Message".to_string(), None));
+        assert_eq!(message_history("  secret plans \nmore", true), ("secret plans".to_string(), Some("  secret plans \nmore".to_string())));
+        assert_eq!(message_history(" \n ", true).0, "Message");
+        assert_eq!(message_history(&"x".repeat(200), true).0.chars().count(), 80);
+    }
 
     #[test]
     fn formats_bytes_humanely() {

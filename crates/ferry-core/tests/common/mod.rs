@@ -171,3 +171,4 @@ pub fn files_in(dir: &Path) -> Vec<String> {
 pub const T: Duration = Duration::from_secs(30);
 
 pub mod proxy;
+pub mod raw;
