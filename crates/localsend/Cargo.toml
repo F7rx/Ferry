@@ -24,7 +24,7 @@ http-body-util = { version = "0.1.4", optional = true }
 hyper = { version = "1.11.0", features = ["http1", "server"], optional = true }
 if-addrs = { version = "0.15.0", optional = true }
 hyper-util = { version = "0.1.20", features = ["server"], optional = true }
-lru = "0.18.1"
+lru = "0.19.0"
 pem = { version = "4.0.0", optional = true }
 percent-encoding = { version = "2.3.2", optional = true }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"], optional = true }
@@ -47,7 +47,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23" }
 tungstenite = "0.30.0"
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
-webrtc = { version = "0.14.0", optional = true }
+webrtc = { version = "0.21.1", optional = true }
 x509-parser = { version = "0.18.1", features = ["verify"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
